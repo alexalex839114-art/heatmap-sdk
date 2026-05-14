@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Heatmap Style Options</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090c12;
+      --panel: #111722;
+      --text: #edf4ff;
+      --muted: #8a9bb2;
+      --line: rgba(255, 255, 255, 0.12);
+      --cyan: #72f7ff;
+      --magenta: #ff30c8;
+      --orange: #ff9b21;
+      --yellow: #ffe15c;
+      --green: #57f287;
+      --red: #ff4c64;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 20% 0%, rgba(58, 99, 255, 0.14), transparent 36%),
+        linear-gradient(180deg, #101722 0%, var(--bg) 100%);
+      color: var(--text);
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+    main { padding: 26px; max-width: 1420px; margin: 0 auto; }
+    h1 { margin: 0 0 6px; font-size: 24px; letter-spacing: 0; }
+    p { color: var(--muted); margin: 0 0 22px; line-height: 1.45; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    .card {
+      border: 1px solid var(--line);
+      background: rgba(12, 17, 26, 0.84);
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+    }
+    .head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+      color: #c9d7e8;
+    }
+    .tag { color: var(--yellow); font-weight: 700; }
+    .chart {
+      position: relative;
+      height: 470px;
+      overflow: hidden;
+      background: #050813;
+    }
+    .heat {
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(90deg, transparent 0 12%, rgba(255, 46, 200, 0.32) 13% 19%, transparent 20% 42%, rgba(255, 154, 33, 0.44) 43% 68%, transparent 69%),
+        linear-gradient(180deg, transparent 0 8%, rgba(255, 225, 92, 0.9) 9% 10%, transparent 11% 24%, rgba(255, 48, 200, 0.48) 25% 27%, transparent 28% 37%, rgba(255, 139, 33, 0.76) 38% 40%, transparent 41% 62%, rgba(255, 65, 120, 0.55) 63% 65%, transparent 66% 78%, rgba(114, 247, 255, 0.72) 79% 80%, transparent 81%),
+        repeating-linear-gradient(180deg, rgba(32, 65, 180, 0.45) 0 2px, transparent 2px 10px),
+        linear-gradient(180deg, #11178e 0%, #0b0e52 58%, #070916 100%);
+    }
+    .heat::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(90deg, transparent 0 55%, rgba(255, 48, 200, 0.52) 56% 74%, transparent 75%),
+        repeating-linear-gradient(180deg, transparent 0 17px, rgba(255, 255, 255, 0.05) 18px 19px);
+      opacity: 0.65;
+      mix-blend-mode: screen;
+    }
+    .price {
+      position: absolute;
+      inset: 0;
+    }
+    .price svg { width: 100%; height: 100%; display: block; }
+    .candle { stroke: #d6f7ff; stroke-width: 1.1; fill: none; }
+    .trade-dot { fill: #aefaff; filter: drop-shadow(0 0 6px #9df7ff); }
+    .wall {
+      position: absolute;
+      right: 0;
+      top: 0;
+      width: 20px;
+      height: 100%;
+      background: linear-gradient(180deg, #ff3ab8, #ff6bd8);
+      clip-path: polygon(35% 0,100% 0,100% 100%,30% 100%,30% 93%,0 93%,0 87%,35% 87%,35% 78%,0 78%,0 70%,35% 70%,35% 55%,0 55%,0 47%,35% 47%,35% 32%,0 32%,0 25%,35% 25%);
+      opacity: 0.95;
+    }
+    .volume {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 104px;
+      background: rgba(4, 7, 13, 0.84);
+      border-top: 1px solid rgba(255, 255, 255, 0.13);
+    }
+    .volume::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(90deg, transparent 0 22%, rgba(255, 48, 200, 0.42) 23% 44%, transparent 45% 70%, rgba(255, 48, 200, 0.45) 71% 100%),
+        linear-gradient(180deg, transparent 0 34%, rgba(255, 42, 170, 0.26) 35% 100%);
+      clip-path: polygon(0 88%,10% 80%,18% 82%,28% 28%,39% 46%,50% 52%,62% 68%,72% 24%,83% 22%,100% 38%,100% 100%,0 100%);
+    }
+    .body { padding: 13px 14px 16px; }
+    h2 { margin: 0 0 7px; font-size: 16px; }
+    .body p { margin: 0; font-size: 13px; }
+    .balanced .heat { filter: saturate(0.96) contrast(1.08); opacity: 0.88; }
+    .balanced .price svg { filter: drop-shadow(0 1px 2px rgba(0,0,0,0.85)); }
+    .reference .heat { filter: saturate(1.45) contrast(1.2); }
+    .reference .candle { stroke-width: 1.35; }
+    .pro .heat {
+      background:
+        linear-gradient(90deg, transparent 0 18%, rgba(255, 178, 39, 0.42) 19% 39%, transparent 40% 64%, rgba(255, 48, 200, 0.38) 65% 86%, transparent 87%),
+        linear-gradient(180deg, transparent 0 15%, rgba(255, 217, 82, 0.78) 16% 17%, transparent 18% 35%, rgba(215, 48, 255, 0.45) 36% 39%, transparent 40% 58%, rgba(255, 141, 42, 0.68) 59% 61%, transparent 62% 80%, rgba(97, 244, 255, 0.54) 81% 82%, transparent 83%),
+        repeating-linear-gradient(180deg, rgba(29, 52, 145, 0.35) 0 1px, transparent 1px 11px),
+        linear-gradient(180deg, #0d176c 0%, #080d34 64%, #05070d 100%);
+      filter: saturate(1.1) contrast(1.18);
+    }
+    .legend {
+      display: flex;
+      gap: 10px;
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .key { display: inline-flex; align-items: center; gap: 6px; }
+    .swatch { width: 18px; height: 8px; border-radius: 2px; background: linear-gradient(90deg, #102878, #ff30c8, #ffe15c); }
+    @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Варианты улучшения heatmap</h1>
+    <p>Сравнение направления визуала: больше читаемой ликвидности, цена поверх карты, яркие зоны, объем/активность снизу.</p>
+    <section class="grid">
+      <article class="card balanced">
+        <div class="head"><span>A. Практичный terminal</span><span class="tag">рекомендую</span></div>
+        <div class="chart">
+          <div class="heat"></div>
+          <div class="price">
+            <svg viewBox="0 0 520 470" preserveAspectRatio="none">
+              <polyline class="candle" points="0,180 28,132 56,160 84,118 112,150 140,116 168,154 196,250 224,292 252,324 280,300 308,286 336,304 364,292 392,316 420,328 448,345 476,368 504,326 520,312"/>
+              <circle class="trade-dot" cx="58" cy="159" r="5"/><circle class="trade-dot" cx="220" cy="292" r="7"/><circle class="trade-dot" cx="392" cy="316" r="5"/>
+            </svg>
+          </div>
+          <div class="volume"></div>
+        </div>
+        <div class="body">
+          <h2>Контраст без перегруза</h2>
+          <p>Оставляем UI рабочим: сильнее палитра, price trace, объемная нижняя панель, но без чрезмерного свечения.</p>
+        </div>
+      </article>
+      <article class="card reference">
+        <div class="head"><span>B. Максимально как референс</span><span class="tag">эффектно</span></div>
+        <div class="chart">
+          <div class="heat"></div>
+          <div class="price">
+            <svg viewBox="0 0 520 470" preserveAspectRatio="none">
+              <polyline class="candle" points="0,166 28,122 56,150 84,106 112,134 140,118 168,156 196,246 224,292 252,316 280,298 308,282 336,300 364,288 392,314 420,336 448,346 476,374 504,326 520,304"/>
+              <circle class="trade-dot" cx="60" cy="150" r="6"/><circle class="trade-dot" cx="220" cy="292" r="8"/><circle class="trade-dot" cx="386" cy="313" r="6"/>
+            </svg>
+          </div>
+          <div class="wall"></div>
+          <div class="volume"></div>
+        </div>
+        <div class="body">
+          <h2>Яркий scalping screen</h2>
+          <p>Самый близкий к картинке: неон, плотные уровни, сильные кластеры, видимый right-side liquidity wall.</p>
+        </div>
+      </article>
+      <article class="card pro">
+        <div class="head"><span>C. Профессиональный restraint</span><span class="tag">читабельно</span></div>
+        <div class="chart">
+          <div class="heat"></div>
+          <div class="price">
+            <svg viewBox="0 0 520 470" preserveAspectRatio="none">
+              <polyline class="candle" points="0,176 28,140 56,155 84,126 112,148 140,124 168,160 196,248 224,282 252,308 280,296 308,284 336,302 364,292 392,318 420,328 448,340 476,356 504,330 520,318"/>
+              <circle class="trade-dot" cx="220" cy="282" r="5"/><circle class="trade-dot" cx="388" cy="318" r="4"/>
+            </svg>
+          </div>
+          <div class="volume"></div>
+        </div>
+        <div class="body">
+          <h2>Меньше шума</h2>
+          <p>Для долгой работы глазами: приглушенный фон, яркие только реально крупные уровни, меньше декоративных вспышек.</p>
+        </div>
+      </article>
+    </section>
+    <div class="legend">
+      <span class="key"><span class="swatch"></span>интенсивность ликвидности</span>
+      <span class="key">cyan line: price/trades overlay</span>
+      <span class="key">bottom: агрессия/объем</span>
+    </div>
+  </main>
+</body>
+</html>
