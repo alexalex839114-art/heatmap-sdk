@@ -1,0 +1,329 @@
+:root {
+  color-scheme: dark;
+  --bg: #11151a;
+  --panel: #1a2129;
+  --text: #e7edf3;
+  --muted: #90a1b3;
+  --border: #293543;
+  --accent: #f0b90b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", sans-serif;
+  background: linear-gradient(180deg, #151b22 0%, #0d1116 100%);
+  color: var(--text);
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 280px minmax(620px, 1fr) 260px;
+}
+
+.controls {
+  max-height: 100vh;
+  padding: 18px;
+  border-right: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.18);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+}
+
+.controls input,
+.controls button {
+  width: 100%;
+  padding: 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.controls input {
+  background: var(--panel);
+  color: var(--text);
+}
+
+.controls button {
+  cursor: pointer;
+  background: var(--accent);
+  color: #231900;
+  font-weight: 700;
+}
+
+.controls button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.controls .danger-button {
+  background: #d92d20;
+  color: #fff5f3;
+}
+
+.status {
+  margin-top: 6px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 12px;
+}
+
+.assistant-panel {
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.panel-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.check-row {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 8px;
+  align-items: center;
+}
+
+.check-row input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
+.assistant-line {
+  min-height: 18px;
+  padding: 3px 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.viewport {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+#heatmap,
+#overlay {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  max-width: calc(100vw - 580px);
+  max-height: calc(100vh - 40px);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.signal-panel {
+  min-height: 100vh;
+  padding: 18px;
+  border-left: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.16);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.signal-card {
+  min-height: 140px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 14px 18px;
+}
+
+.signal-kicker {
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.signal-label {
+  margin-top: 6px;
+  font-size: 36px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.signal-reason {
+  margin-top: 10px;
+  min-height: 32px;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.signal-buy {
+  background: rgba(22, 163, 74, 0.82);
+}
+
+.signal-sell {
+  background: rgba(220, 38, 38, 0.82);
+}
+
+.signal-risk {
+  background: rgba(217, 119, 6, 0.84);
+}
+
+.signal-wait {
+  background: rgba(75, 85, 99, 0.8);
+}
+
+.signal-lights {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.signal-light {
+  height: 56px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(75, 85, 99, 0.22);
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  overflow: hidden;
+  opacity: 0.28;
+  filter: saturate(0.55);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.signal-light.active {
+  opacity: 1;
+  filter: saturate(1.2);
+}
+
+.exchange-half {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.24;
+}
+
+.exchange-half + .exchange-half {
+  border-left: 1px solid rgba(255, 255, 255, 0.26);
+}
+
+.exchange-half.active {
+  opacity: 1;
+}
+
+.exchange-half.off {
+  opacity: 0.15;
+}
+
+.exchange-half.risk {
+  background: rgba(217, 119, 6, 0.9);
+}
+
+.buy-light .exchange-half.active {
+  background: rgba(22, 163, 74, 0.9);
+}
+
+.wait-light .exchange-half.active {
+  background: rgba(217, 119, 6, 0.9);
+}
+
+.sell-light .exchange-half.active {
+  background: rgba(220, 38, 38, 0.9);
+}
+
+.signal-detail {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+}
+
+.signal-settings {
+  display: grid;
+  grid-template-columns: 1fr 86px;
+  gap: 8px 10px;
+  align-items: center;
+}
+
+.signal-settings label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.signal-settings input {
+  width: 100%;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+}
+
+.signal-settings-check {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.signal-settings-check input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
+#heatmap {
+  z-index: 1;
+  background: #06080b;
+}
+
+#overlay {
+  z-index: 2;
+  pointer-events: none;
+  background: transparent;
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr auto;
+  }
+
+  .controls {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  #heatmap,
+  #overlay {
+    max-width: calc(100vw - 24px);
+  }
+
+  .signal-panel {
+    min-height: auto;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+}

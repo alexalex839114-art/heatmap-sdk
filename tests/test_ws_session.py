@@ -1,0 +1,947 @@
+import asyncio
+
+import pytest
+from types import SimpleNamespace
+
+from adaptive_sdk.types import ExhaustionType, MetricsSnapshot, Signal
+from app.ws_session import BrowserSession, LiveHeatmapService
+from app.assistant_config import AssistantRiskSettings
+from app.adaptive_service import AdaptiveMarketService
+from app.position import PositionState
+from app.position_tracker import PositionTracker
+from app.settings import FRAME_INTERVAL_MS
+
+
+def test_start_heatmap_requires_synced_connection():
+    session = BrowserSession()
+
+    with pytest.raises(RuntimeError):
+        session.start_heatmap()
+
+
+def test_stop_heatmap_changes_state_to_stopped():
+    session = BrowserSession()
+    session.mark_synced("BTCUSDT")
+    session.start_heatmap()
+    session.stop_heatmap()
+
+    assert session.state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_set_assistant_settings_updates_risk_settings():
+    session = BrowserSession()
+
+    event = await session.handle_command(
+        {
+            "type": "set_assistant_settings",
+            "settings": {
+                "max_loss_usdt": 2.5,
+                "max_holding_time_sec": 12,
+                "confirmation_ms": 250,
+                "opposite_signal_exit_enabled": False,
+                "toxic_vpin_exit_enabled": True,
+                "min_price_excursion_bps": 3.5,
+                "min_price_excursion_vol_multiplier": 0.8,
+                "stop_rv_multiplier": 1.1,
+                "take_rv_multiplier": 1.9,
+            },
+        }
+    )
+
+    assert event["type"] == "assistant_status"
+    assert session.assistant_settings.max_loss_usdt == 2.5
+    assert session.assistant_settings.max_holding_time_sec == 12.0
+    assert session.assistant_settings.confirmation_ms == 250
+    assert session.assistant_settings.opposite_signal_exit_enabled is False
+    assert session.assistant_settings.min_price_excursion_bps == 3.5
+    assert session.assistant_settings.min_price_excursion_vol_multiplier == 0.8
+    assert event["min_price_excursion_bps"] == 3.5
+    assert event["min_price_excursion_vol_multiplier"] == 0.8
+    assert session.assistant_settings.stop_rv_multiplier == 1.1
+    assert session.assistant_settings.take_rv_multiplier == 1.9
+
+
+def test_assistant_status_includes_rv_exit_multipliers():
+    session = BrowserSession()
+    session.assistant_settings = AssistantRiskSettings(
+        stop_rv_multiplier=1.2,
+        take_rv_multiplier=2.1,
+    )
+
+    event = session.assistant_status_event()
+
+    assert event["stop_rv_multiplier"] == 1.2
+    assert event["take_rv_multiplier"] == 2.1
+
+
+def test_assistant_status_includes_auto_trade_settings():
+    session = BrowserSession()
+    session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=True,
+        trade_notional_usdt=12.5,
+    )
+
+    event = session.assistant_status_event()
+
+    assert event["auto_trade_enabled"] is True
+    assert event["trade_notional_usdt"] == 12.5
+
+
+def test_trading_status_event_includes_lifecycle_and_cooldown():
+    service = LiveHeatmapService()
+    service.trading_state = "COOLDOWN"
+    service.cooldown_until_ms = 41_000
+
+    event = service.trading_status_event(now_ms=11_000)
+
+    assert event["type"] == "trading_status"
+    assert event["state"] == "COOLDOWN"
+    assert event["enabled"] is False
+    assert event["cooldown_remaining_ms"] == 30_000
+
+
+def test_market_settings_are_applied_to_active_sdk():
+    service = LiveHeatmapService()
+    service.adaptive_market = AdaptiveMarketService("BTCUSDT")
+    service.bybit_adaptive_market = AdaptiveMarketService("BTCUSDT")
+    service.session.assistant_settings = AssistantRiskSettings(
+        min_price_excursion_bps=4.0,
+        min_price_excursion_vol_multiplier=1.2,
+    )
+
+    service._apply_assistant_market_settings()
+
+    cfg = service.adaptive_market.symbol_config()
+    assert cfg.min_price_excursion_bps == 4.0
+    assert cfg.min_price_excursion_vol_multiplier == 1.2
+    bybit_cfg = service.bybit_adaptive_market.symbol_config()
+    assert bybit_cfg.min_price_excursion_bps == 4.0
+    assert bybit_cfg.min_price_excursion_vol_multiplier == 1.2
+
+
+@pytest.mark.asyncio
+async def test_auto_exit_commands_toggle_session_setting():
+    session = BrowserSession()
+
+    enabled = await session.handle_command({"type": "enable_auto_exit"})
+    disabled = await session.handle_command({"type": "disable_auto_exit"})
+
+    assert enabled["auto_exit_enabled"] is True
+    assert disabled["auto_exit_enabled"] is False
+    assert session.assistant_settings.auto_exit_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_auto_trade_commands_toggle_session_setting():
+    session = BrowserSession()
+
+    enabled = await session.handle_command({"type": "enable_auto_trade"})
+    disabled = await session.handle_command({"type": "disable_auto_trade"})
+
+    assert enabled["auto_trade_enabled"] is True
+    assert disabled["auto_trade_enabled"] is False
+    assert session.assistant_settings.auto_trade_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_connect_command_sets_connecting_status():
+    session = BrowserSession()
+
+    event = await session.handle_command(
+        {"type": "connect", "symbol": "BTCUSDT", "compression": 2}
+    )
+
+    assert event["type"] == "status"
+    assert event["state"] == "connecting"
+    assert event["symbol"] == "BTCUSDT"
+    assert event["compression"] == 2
+    assert session.compression == 2
+
+
+@pytest.mark.asyncio
+async def test_connect_uses_client_tick_size_and_requested_aggregation(monkeypatch):
+    service = LiveHeatmapService()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.tick_size = 0.1
+
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setattr("app.ws_session.BinanceMarketClient", FakeClient)
+    monkeypatch.setattr("app.ws_session.BybitMarketClient", FakeClient)
+
+    await service._connect_symbol("BTCUSDT", compression=3)
+
+    assert service.frame_builder.tick_size == 0.1
+    assert service.frame_builder.aggregation == 3
+
+
+@pytest.mark.asyncio
+async def test_connect_wires_adaptive_market_callbacks(monkeypatch):
+    service = LiveHeatmapService()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.tick_size = 0.1
+            self.on_trade = kwargs.get("on_trade")
+            self.on_book_update = kwargs.get("on_book_update")
+
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setattr("app.ws_session.BinanceMarketClient", FakeClient)
+    monkeypatch.setattr("app.ws_session.BybitMarketClient", FakeClient)
+
+    await service._connect_symbol("BTCUSDT", compression=1)
+
+    assert service.adaptive_market is not None
+    assert service.entry_filter is not None
+    assert service.exit_engine is not None
+    assert service.client.on_trade is not None
+    assert service.client.on_book_update is not None
+    assert service.bybit_client is not None
+    assert service.bybit_adaptive_market is not None
+    assert service.bybit_entry_filter is not None
+    assert service.bybit_client.on_trade is not None
+    assert service.bybit_client.on_book_update is not None
+
+
+@pytest.mark.asyncio
+async def test_bybit_trade_updates_only_bybit_sdk():
+    service = LiveHeatmapService()
+    service.adaptive_market = AdaptiveMarketService("BTCUSDT")
+    service.bybit_adaptive_market = AdaptiveMarketService("BTCUSDT")
+
+    service._on_bybit_market_trade(
+        {
+            "symbol": "BTCUSDT",
+            "price": 65000.0,
+            "qty": 0.1,
+            "timestamp": 1700000000000,
+            "is_buyer_maker": False,
+        }
+    )
+
+    assert service.adaptive_market.trade_count == 0
+    assert service.bybit_adaptive_market.trade_count == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_updates_tracker():
+    service = LiveHeatmapService()
+    service.position_tracker = PositionTracker("BTCUSDT")
+
+    class FakeAccount:
+        async def fetch_position(self, symbol):
+            return PositionState(
+                symbol=symbol,
+                amount=0.01,
+                entry_price=65000,
+                unrealized_pnl=1.2,
+            )
+
+    service.account_client = FakeAccount()
+
+    position = await service._refresh_position("BTCUSDT", now_ms=1000)
+
+    assert position is not None
+    assert position.side == "LONG"
+    assert position.opened_at_ms == 1000
+    assert service.current_position == position
+
+
+@pytest.mark.asyncio
+async def test_exit_evaluation_closes_position_once_on_hard_exit():
+    service = LiveHeatmapService()
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_exit_enabled=True,
+        max_loss_usdt=5.0,
+    )
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000,
+        unrealized_pnl=-6.0,
+    )
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+            self.close_pending = False
+
+        async def close_position(self, position):
+            self.calls.append(position)
+            self.close_pending = True
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    decision = await service._evaluate_exit(now_ms=1000)
+
+    assert decision.should_close is True
+    assert decision.reason == "max_loss"
+    assert len(service.order_executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_exit_evaluation_broadcasts_exit_and_order_status():
+    service = LiveHeatmapService()
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_exit_enabled=True,
+        max_loss_usdt=5.0,
+    )
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000,
+        unrealized_pnl=-6.0,
+    )
+    events = []
+
+    async def capture(payload):
+        events.append(payload)
+
+    service.broadcast = capture
+
+    class FakeExecutor:
+        close_pending = False
+
+        async def close_position(self, position):
+            return {"status": "NEW", "clientOrderId": "abc"}
+
+    service.order_executor = FakeExecutor()
+
+    await service._evaluate_exit(now_ms=1000)
+
+    assert events[0]["type"] == "exit_status"
+    assert events[0]["reason"] == "max_loss"
+    assert events[1]["type"] == "order_status"
+    assert events[1]["status"] == "NEW"
+
+
+@pytest.mark.asyncio
+async def test_exit_ignores_stale_opposite_signal():
+    service = LiveHeatmapService()
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_exit_enabled=True,
+        opposite_signal_exit_enabled=True,
+    )
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000,
+    )
+    service.adaptive_market = SimpleNamespace(
+        state=lambda: SimpleNamespace(vpin=0.1),
+        latest_signal=Signal(
+            signal_id="old",
+            symbol="BTCUSDT",
+            timestamp=1.0,
+            exhaustion_type=ExhaustionType.BUY_EXHAUSTION,
+            confidence=0.95,
+            arm_id=1,
+            metrics=MetricsSnapshot(
+                vpin=0.1,
+                z_score_buy_flow=3.0,
+                z_score_sell_flow=0.0,
+                obi=0.0,
+                bucket_size=1.0,
+                buckets_filled=10,
+            ),
+        ),
+        latest_signal_for_display=lambda now_ms: None,
+    )
+
+    class FakeExecutor:
+        close_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def close_position(self, position):
+            self.calls.append(position)
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    decision = await service._evaluate_exit(now_ms=10_000)
+
+    assert decision.should_close is False
+    assert service.order_executor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_frame_loop_survives_transient_position_poll_error():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.start_heatmap()
+
+    class FakeFrameBuilder:
+        def __init__(self):
+            self.calls = 0
+
+        def build(self, book, trades):
+            self.calls += 1
+            if self.calls >= 2:
+                service.session.stop_heatmap()
+            return SimpleNamespace(
+                timestamp=1,
+                column=[0],
+                mid_price=100.0,
+                best_bid=99.0,
+                best_ask=101.0,
+                trades=[],
+            )
+
+    async def failing_poll(now_ms):
+        raise RuntimeError("temporary account failure")
+
+    events = []
+
+    async def capture(payload):
+        events.append(payload)
+
+    async def noop_exit(now_ms):
+        return None
+
+    async def noop_snapshot():
+        return None
+
+    service.frame_builder = FakeFrameBuilder()
+    service._poll_position_if_due = failing_poll
+    service._evaluate_exit = noop_exit
+    service._broadcast_assistant_snapshot = noop_snapshot
+    service.broadcast = capture
+
+    await service._frame_loop()
+
+    assert service.frame_builder.calls >= 2
+    assert any(event["type"] == "account_error" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_frame_loop_does_not_wait_for_slow_position_poll():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.start_heatmap()
+
+    class FakeFrameBuilder:
+        def __init__(self):
+            self.calls = 0
+
+        def build(self, book, trades):
+            self.calls += 1
+            if self.calls >= 3:
+                service.session.stop_heatmap()
+            return SimpleNamespace(
+                timestamp=self.calls,
+                column=[0],
+                mid_price=100.0,
+                best_bid=99.0,
+                best_ask=101.0,
+                trades=[],
+            )
+
+    async def slow_poll(now_ms):
+        await asyncio.sleep(1)
+
+    async def noop_exit(now_ms):
+        return None
+
+    async def noop_snapshot():
+        return None
+
+    service.frame_builder = FakeFrameBuilder()
+    service._poll_position_if_due = slow_poll
+    service._evaluate_exit = noop_exit
+    service._broadcast_assistant_snapshot = noop_snapshot
+    service.broadcast = lambda payload: _async_none()
+
+    await asyncio.wait_for(service._frame_loop(), timeout=0.5)
+
+    assert service.frame_builder.calls >= 3
+
+
+async def _async_none():
+    return None
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_marks_close_confirmed_when_position_is_flat():
+    service = LiveHeatmapService()
+    service.position_tracker = PositionTracker("BTCUSDT")
+
+    class FakeAccount:
+        async def fetch_position(self, symbol):
+            return PositionState(symbol=symbol, amount=0.0, entry_price=0.0)
+
+    class FakeExecutor:
+        def __init__(self):
+            self.close_pending = True
+            self.close_confirmed = 0
+
+        def mark_close_confirmed(self):
+            self.close_confirmed += 1
+            self.close_pending = False
+
+    service.account_client = FakeAccount()
+    service.order_executor = FakeExecutor()
+
+    await service._refresh_position("BTCUSDT", now_ms=1000)
+
+    assert service.order_executor.close_pending is False
+    assert service.order_executor.close_confirmed == 1
+
+
+@pytest.mark.asyncio
+async def test_position_polling_uses_frame_interval():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.position_tracker = PositionTracker("BTCUSDT")
+    service._last_position_poll_ms = 1_000
+
+    class FakeAccount:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_position(self, symbol):
+            self.calls += 1
+            return PositionState(symbol=symbol, amount=0.0, entry_price=0.0)
+
+    service.account_client = FakeAccount()
+
+    await service._poll_position_if_due(1_000 + FRAME_INTERVAL_MS - 1)
+    await service._poll_position_if_due(1_000 + FRAME_INTERVAL_MS)
+
+    assert service.account_client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_exit_uses_current_book_mark_for_max_loss():
+    service = LiveHeatmapService()
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_exit_enabled=True,
+        max_loss_usdt=5.0,
+    )
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=1.0,
+        entry_price=100.0,
+        unrealized_pnl=0.0,
+    )
+    service.book.bids = {94.0: 1.0}
+    service.book.asks = {94.5: 1.0}
+
+    class FakeExecutor:
+        close_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def close_position(self, position):
+            self.calls.append(position)
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    decision = await service._evaluate_exit(now_ms=1000)
+
+    assert decision.reason == "max_loss"
+    assert service.order_executor.calls == [service.current_position]
+
+
+@pytest.mark.asyncio
+async def test_auto_trade_opens_long_on_binance_bybit_confluence():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=True,
+        trade_notional_usdt=13.0,
+    )
+    service.current_position = None
+    service.trading_state = "ARMED"
+    service.client = SimpleNamespace(quantity_step=0.001, min_quantity=0.001)
+    service.book.bids = {64999.0: 1.0}
+    service.book.asks = {65000.0: 1.0}
+    service._last_entry_results = {
+        "binance": {
+            "market_state": "READY",
+            "long_filter": "OK",
+            "short_filter": "BLOCKED",
+        },
+        "bybit": {
+            "market_state": "READY",
+            "long_filter": "OK",
+            "short_filter": "BLOCKED",
+        },
+    }
+
+    class FakeExecutor:
+        open_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def open_position(
+            self,
+            symbol,
+            *,
+            side,
+            notional_usdt,
+            mark_price,
+            quantity_step=None,
+            min_quantity=None,
+        ):
+            self.calls.append(
+                (
+                    symbol,
+                    side,
+                    notional_usdt,
+                    mark_price,
+                    quantity_step,
+                    min_quantity,
+                )
+            )
+            self.open_pending = True
+            return {"status": "NEW", "clientOrderId": "open-1"}
+
+    service.order_executor = FakeExecutor()
+    events = []
+
+    async def capture(payload):
+        events.append(payload)
+
+    service.broadcast = capture
+
+    await service._evaluate_auto_trade(now_ms=1000)
+
+    assert service.order_executor.calls == [
+        ("BTCUSDT", "LONG", 13.0, 65000.0, 0.001, 0.001)
+    ]
+    assert events[-1]["type"] == "order_status"
+    assert events[-1]["side"] == "LONG"
+
+
+@pytest.mark.asyncio
+async def test_auto_trade_refreshes_position_before_opening():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.assistant_settings = AssistantRiskSettings(auto_trade_enabled=True)
+    service.current_position = None
+    service.trading_state = "ARMED"
+    service.position_tracker = PositionTracker("BTCUSDT")
+    service.client = SimpleNamespace(quantity_step=0.001, min_quantity=0.001)
+    service.book.bids = {64999.0: 1.0}
+    service.book.asks = {65000.0: 1.0}
+    service._last_entry_results = {
+        "binance": {
+            "market_state": "READY",
+            "long_filter": "OK",
+            "short_filter": "BLOCKED",
+        },
+        "bybit": {
+            "market_state": "READY",
+            "long_filter": "OK",
+            "short_filter": "BLOCKED",
+        },
+    }
+
+    class FakeAccount:
+        async def fetch_position(self, symbol):
+            return PositionState(symbol=symbol, amount=0.01, entry_price=65000)
+
+    class FakeExecutor:
+        open_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def open_position(self, symbol, **kwargs):
+            self.calls.append((symbol, kwargs))
+            return {"status": "NEW"}
+
+        def mark_open_confirmed(self):
+            return None
+
+    service.account_client = FakeAccount()
+    service.order_executor = FakeExecutor()
+
+    await service._evaluate_auto_trade(now_ms=1000)
+
+    assert service.current_position is not None
+    assert service.order_executor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_auto_trade_does_not_open_without_confluence_or_when_position_open():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.assistant_settings = AssistantRiskSettings(auto_trade_enabled=True)
+    service.trading_state = "ARMED"
+    service.book.bids = {64999.0: 1.0}
+    service.book.asks = {65000.0: 1.0}
+    service._last_entry_results = {
+        "binance": {
+            "market_state": "READY",
+            "long_filter": "OK",
+            "short_filter": "BLOCKED",
+        },
+        "bybit": {
+            "market_state": "READY",
+            "long_filter": "BLOCKED",
+            "short_filter": "OK",
+        },
+    }
+
+    class FakeExecutor:
+        open_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def open_position(self, symbol, *, side, notional_usdt, mark_price):
+            self.calls.append((symbol, side, notional_usdt, mark_price))
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    await service._evaluate_auto_trade(now_ms=1000)
+
+    assert service.order_executor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_start_trading_waits_for_warm_entry_filters_before_arming():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+
+    class FakeAccount:
+        async def fetch_position(self, symbol):
+            return None
+
+    service.account_client = FakeAccount()
+    service.order_executor = SimpleNamespace()
+    service.position_tracker = PositionTracker("BTCUSDT")
+    service.client = SimpleNamespace()
+    service.bybit_client = SimpleNamespace()
+    service._last_entry_results = {
+        "binance": {"market_state": "WARMING", "long_filter": "WAIT", "short_filter": "WAIT"},
+        "bybit": {"market_state": "READY", "long_filter": "WAIT", "short_filter": "WAIT"},
+    }
+
+    event = await service.start_trading(now_ms=1000)
+
+    assert event["state"] == "WARMING"
+    assert service.session.assistant_settings.auto_trade_enabled is True
+
+    service._last_entry_results["binance"]["market_state"] = "READY"
+    event = service._refresh_trading_readiness(now_ms=1100)
+
+    assert event["state"] == "ARMED"
+
+
+def test_trading_readiness_arms_when_filters_are_warmed_but_waiting():
+    service = LiveHeatmapService()
+    service._last_entry_results = {
+        "binance": {
+            "market_state": "READY",
+            "long_filter": "WAIT",
+            "short_filter": "WAIT",
+            "reason": "no_signal",
+        },
+        "bybit": {
+            "market_state": "RISKY",
+            "long_filter": "WAIT",
+            "short_filter": "WAIT",
+            "reason": "adaptive_elevated_vpin",
+        },
+    }
+
+    event = service._refresh_trading_readiness(now_ms=1000)
+
+    assert event["state"] == "ARMED"
+    assert "binance READY no_signal" in event["message"]
+    assert "bybit RISKY adaptive_elevated_vpin" in event["message"]
+
+
+def test_trading_readiness_reports_warming_exchange_progress():
+    service = LiveHeatmapService()
+    service._last_entry_results = {
+        "binance": {
+            "market_state": "WARMING",
+            "long_filter": "WAIT",
+            "short_filter": "WAIT",
+            "reason": "warming 3/10 buckets, 80/200 trades",
+        },
+        "bybit": {
+            "market_state": "READY",
+            "long_filter": "WAIT",
+            "short_filter": "WAIT",
+            "reason": "no_signal",
+        },
+    }
+
+    event = service._refresh_trading_readiness(now_ms=1000)
+
+    assert event["state"] == "WARMING"
+    assert "binance WARMING warming 3/10 buckets, 80/200 trades" in event["message"]
+    assert "bybit READY no_signal" in event["message"]
+
+
+@pytest.mark.asyncio
+async def test_stop_trading_blocks_new_entries_without_disabling_auto_exit():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=True,
+        auto_exit_enabled=True,
+    )
+    service.trading_state = "ARMED"
+
+    event = await service.stop_trading()
+
+    assert event["state"] == "STOPPED"
+    assert service.session.assistant_settings.auto_trade_enabled is False
+    assert service.session.assistant_settings.auto_exit_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_auto_trade_is_blocked_until_trading_is_armed():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.assistant_settings = AssistantRiskSettings(auto_trade_enabled=True)
+    service.trading_state = "STOPPED"
+    service.client = SimpleNamespace(quantity_step=0.001, min_quantity=0.001)
+    service.book.bids = {64999.0: 1.0}
+    service.book.asks = {65000.0: 1.0}
+    service._last_entry_results = {
+        "binance": {"market_state": "READY", "long_filter": "OK", "short_filter": "BLOCKED"},
+        "bybit": {"market_state": "READY", "long_filter": "OK", "short_filter": "BLOCKED"},
+    }
+
+    class FakeExecutor:
+        open_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def open_position(self, symbol, **kwargs):
+            self.calls.append((symbol, kwargs))
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    await service._evaluate_auto_trade(now_ms=1000)
+
+    assert service.order_executor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_flat_close_confirmation_cancels_orders_and_starts_cooldown():
+    service = LiveHeatmapService()
+    service.position_tracker = PositionTracker("BTCUSDT")
+    service.trading_state = "IN_POSITION"
+
+    class FakeAccount:
+        async def fetch_position(self, symbol):
+            return PositionState(symbol=symbol, amount=0.0, entry_price=0.0)
+
+    class FakeExecutor:
+        def __init__(self):
+            self.close_pending = True
+            self.close_confirmed = 0
+            self.cancel_calls = []
+
+        def mark_close_confirmed(self):
+            self.close_confirmed += 1
+            self.close_pending = False
+
+        async def cancel_all_open_orders(self, symbol):
+            self.cancel_calls.append(symbol)
+            return {"code": 200}
+
+    service.account_client = FakeAccount()
+    service.order_executor = FakeExecutor()
+
+    await service._refresh_position("BTCUSDT", now_ms=1000)
+
+    assert service.order_executor.close_confirmed == 1
+    assert service.order_executor.cancel_calls == ["BTCUSDT"]
+    assert service.trading_state == "COOLDOWN"
+    assert service.cooldown_until_ms == 31_000
+
+
+@pytest.mark.asyncio
+async def test_auto_trade_is_blocked_during_cooldown():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.assistant_settings = AssistantRiskSettings(auto_trade_enabled=True)
+    service.trading_state = "COOLDOWN"
+    service.cooldown_until_ms = 31_000
+    service.client = SimpleNamespace(quantity_step=0.001, min_quantity=0.001)
+    service.book.bids = {64999.0: 1.0}
+    service.book.asks = {65000.0: 1.0}
+    service._last_entry_results = {
+        "binance": {"market_state": "READY", "long_filter": "OK", "short_filter": "BLOCKED"},
+        "bybit": {"market_state": "READY", "long_filter": "OK", "short_filter": "BLOCKED"},
+    }
+
+    class FakeExecutor:
+        open_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def open_position(self, symbol, **kwargs):
+            self.calls.append((symbol, kwargs))
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    await service._evaluate_auto_trade(now_ms=30_999)
+
+    assert service.order_executor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_emergency_flatten_cancels_orders_and_closes_open_position():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000,
+    )
+
+    class FakeExecutor:
+        close_pending = False
+
+        def __init__(self):
+            self.cancel_calls = []
+            self.close_calls = []
+
+        async def cancel_all_open_orders(self, symbol):
+            self.cancel_calls.append(symbol)
+            return {"code": 200}
+
+        async def close_position(self, position):
+            self.close_calls.append(position)
+            self.close_pending = True
+            return {"status": "NEW", "clientOrderId": "close-1"}
+
+    service.order_executor = FakeExecutor()
+
+    event = await service.emergency_flatten(now_ms=2000)
+
+    assert event["state"] == "STOPPED"
+    assert service.order_executor.cancel_calls == ["BTCUSDT"]
+    assert service.order_executor.close_calls == [service.current_position]

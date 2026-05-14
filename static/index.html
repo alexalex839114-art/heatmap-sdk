@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Binance Live Heatmap</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="app-shell">
+    <section class="controls">
+      <label for="symbol">Symbol</label>
+      <input id="symbol" value="BTCUSDT" autocomplete="off">
+      <label for="compression">Compression</label>
+      <input id="compression" type="number" min="1" step="1" value="1">
+      <button id="connect-btn" type="button">Connect WS</button>
+      <button id="toggle-btn" type="button" disabled>Start Heatmap</button>
+      <div id="status" class="status">disconnected</div>
+      <div id="display-step" class="status">display step: -</div>
+      <div class="assistant-panel" aria-label="Assistant">
+        <div class="panel-title">Assistant</div>
+        <button id="trading-toggle-btn" type="button" disabled>START Trading</button>
+        <button id="emergency-flatten-btn" class="danger-button" type="button" disabled>
+          Emergency Flatten
+        </button>
+        <div id="trading-status" class="assistant-line">trading: OFF</div>
+        <label for="trade-notional">Trade USDT</label>
+        <input id="trade-notional" type="number" min="0" step="0.1" value="10">
+        <label class="check-row" for="auto-exit">
+          <input id="auto-exit" type="checkbox">
+          <span>Auto-exit</span>
+        </label>
+        <label for="max-loss">Max loss USDT</label>
+        <input id="max-loss" type="number" min="0" step="0.1" value="5">
+        <label for="max-holding">Max holding sec</label>
+        <input id="max-holding" type="number" min="1" step="1" value="60">
+        <label for="confirmation-ms">Confirmation ms</label>
+        <input id="confirmation-ms" type="number" min="0" step="50" value="500">
+        <label for="stop-rv-multiplier">Stop RV x</label>
+        <input id="stop-rv-multiplier" type="number" min="0" step="0.1" value="1">
+        <label for="take-rv-multiplier">Take RV x</label>
+        <input id="take-rv-multiplier" type="number" min="0" step="0.1" value="1.5">
+        <label class="check-row" for="opposite-exit">
+          <input id="opposite-exit" type="checkbox" checked>
+          <span>Opposite signal</span>
+        </label>
+        <label class="check-row" for="toxic-exit">
+          <input id="toxic-exit" type="checkbox" checked>
+          <span>Toxic VPIN</span>
+        </label>
+        <div id="assistant-status" class="assistant-line">assistant: -</div>
+        <div id="entry-filter" class="assistant-line">entry: -</div>
+        <div id="position-state" class="assistant-line">position: flat</div>
+        <div id="exit-state" class="assistant-line">exit: -</div>
+      </div>
+    </section>
+    <section class="viewport">
+      <canvas id="heatmap" width="1200" height="768"></canvas>
+      <canvas id="overlay" width="1200" height="768"></canvas>
+    </section>
+    <section class="signal-panel" aria-label="SDK Signal">
+      <div id="signal-card" class="signal-card signal-wait">
+        <div class="signal-kicker">SDK</div>
+        <div id="signal-label" class="signal-label">WAIT</div>
+        <div id="signal-reason" class="signal-reason">No data</div>
+      </div>
+      <div class="signal-lights" aria-label="Signal lights">
+        <div id="buy-light" class="signal-light buy-light" data-signal-row="buy">
+          <div class="exchange-half" data-exchange-half="binance"><span>BIN</span></div>
+          <div class="exchange-half" data-exchange-half="bybit"><span>BYB</span></div>
+          <div class="exchange-half" data-exchange-half="coinbase"><span>CB</span></div>
+          <div class="exchange-half" data-exchange-half="kraken"><span>KR</span></div>
+        </div>
+        <div id="wait-light" class="signal-light wait-light active" data-signal-row="wait">
+          <div class="exchange-half active" data-exchange-half="binance"><span>BIN</span></div>
+          <div class="exchange-half active" data-exchange-half="bybit"><span>BYB</span></div>
+          <div class="exchange-half active" data-exchange-half="coinbase"><span>CB</span></div>
+          <div class="exchange-half active" data-exchange-half="kraken"><span>KR</span></div>
+        </div>
+        <div id="sell-light" class="signal-light sell-light" data-signal-row="sell">
+          <div class="exchange-half" data-exchange-half="binance"><span>BIN</span></div>
+          <div class="exchange-half" data-exchange-half="bybit"><span>BYB</span></div>
+          <div class="exchange-half" data-exchange-half="coinbase"><span>CB</span></div>
+          <div class="exchange-half" data-exchange-half="kraken"><span>KR</span></div>
+        </div>
+      </div>
+      <div class="signal-settings" aria-label="Absorption settings">
+        <label for="min-excursion-bps">Min move bps</label>
+        <input id="min-excursion-bps" type="number" min="0" step="0.1" value="2">
+        <label for="rv-multiplier">RV multiplier</label>
+        <input id="rv-multiplier" type="number" min="0" step="0.1" value="0.6">
+        <label class="check-row signal-settings-check" for="require-extrema">
+          <input id="require-extrema" type="checkbox" checked>
+          <span>Price extrema gate (knife-catch off)</span>
+        </label>
+      </div>
+      <div id="signal-detail" class="signal-detail">entry: -</div>
+    </section>
+  </main>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
