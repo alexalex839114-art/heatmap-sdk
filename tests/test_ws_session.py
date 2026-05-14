@@ -9,7 +9,7 @@ from app.assistant_config import AssistantRiskSettings
 from app.adaptive_service import AdaptiveMarketService
 from app.position import PositionState
 from app.position_tracker import PositionTracker
-from app.settings import FRAME_INTERVAL_MS
+from app.settings import FRAME_INTERVAL_MS, POSITION_REST_FALLBACK_INTERVAL_MS
 
 
 def test_start_heatmap_requires_synced_connection():
@@ -503,7 +503,13 @@ async def test_refresh_position_marks_close_confirmed_when_position_is_flat():
 
 
 @pytest.mark.asyncio
-async def test_position_polling_uses_frame_interval():
+async def test_position_polling_uses_fallback_interval():
+    """REST fallback poll fires only at POSITION_REST_FALLBACK_INTERVAL_MS cadence.
+
+    User-data WebSocket is now the primary source of position updates, so the
+    REST endpoint is throttled down to a safe rate well under Binance's
+    per-IP weight limit.
+    """
     service = LiveHeatmapService()
     service.session.mark_synced("BTCUSDT")
     service.position_tracker = PositionTracker("BTCUSDT")
@@ -519,10 +525,163 @@ async def test_position_polling_uses_frame_interval():
 
     service.account_client = FakeAccount()
 
-    await service._poll_position_if_due(1_000 + FRAME_INTERVAL_MS - 1)
+    assert POSITION_REST_FALLBACK_INTERVAL_MS > FRAME_INTERVAL_MS
+    # Frame-loop cadence must NOT trigger a REST poll any more.
     await service._poll_position_if_due(1_000 + FRAME_INTERVAL_MS)
-
+    assert service.account_client.calls == 0
+    # Just before the fallback window — still no call.
+    await service._poll_position_if_due(
+        1_000 + POSITION_REST_FALLBACK_INTERVAL_MS - 1
+    )
+    assert service.account_client.calls == 0
+    # At the fallback window — one REST call.
+    await service._poll_position_if_due(
+        1_000 + POSITION_REST_FALLBACK_INTERVAL_MS
+    )
     assert service.account_client.calls == 1
+    # Subsequent calls within another fallback window are throttled.
+    await service._poll_position_if_due(
+        1_000 + POSITION_REST_FALLBACK_INTERVAL_MS + 1
+    )
+    assert service.account_client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_user_data_account_update_pushes_position_state():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.position_tracker = PositionTracker("BTCUSDT")
+    captured = []
+
+    async def capture(payload):
+        captured.append(payload)
+
+    service.broadcast = capture
+
+    event = {
+        "e": "ACCOUNT_UPDATE",
+        "E": 1_700_000_000_500,
+        "a": {
+            "P": [
+                {
+                    "s": "BTCUSDT",
+                    "pa": "0.01",
+                    "ep": "65000.0",
+                    "bep": "65010.0",
+                    "up": "1.25",
+                    "ps": "BOTH",
+                }
+            ]
+        },
+    }
+    from app.position import parse_account_update_positions
+
+    positions = parse_account_update_positions(event)
+    await service._on_user_data_account_update(positions, event)
+
+    assert service.current_position is not None
+    assert service.current_position.side == "LONG"
+    assert service.current_position.quantity == 0.01
+    # User-data push must suppress an immediate REST fallback.
+    assert service._last_position_poll_ms == 1_700_000_000_500
+    # And it must broadcast a position event.
+    assert any(event["type"] == "position" for event in captured)
+
+
+@pytest.mark.asyncio
+async def test_user_data_account_update_confirms_flat_close():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.position_tracker = PositionTracker("BTCUSDT")
+    service.position_tracker.current = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000.0,
+    )
+    service.current_position = service.position_tracker.current
+
+    async def noop(payload):
+        return None
+
+    service.broadcast = noop
+
+    class FakeExecutor:
+        def __init__(self):
+            self.close_pending = True
+            self.cancel_calls: list[str] = []
+            self.close_confirmed = 0
+
+        def mark_close_confirmed(self):
+            self.close_pending = False
+            self.close_confirmed += 1
+
+        async def cancel_all_open_orders(self, symbol):
+            self.cancel_calls.append(symbol)
+
+    service.order_executor = FakeExecutor()
+
+    flat_event = {
+        "e": "ACCOUNT_UPDATE",
+        "E": 1_700_000_001_000,
+        "a": {
+            "P": [
+                {
+                    "s": "BTCUSDT",
+                    "pa": "0.0",
+                    "ep": "0.0",
+                    "bep": "0.0",
+                    "up": "0.0",
+                    "ps": "BOTH",
+                }
+            ]
+        },
+    }
+    from app.position import parse_account_update_positions
+
+    await service._on_user_data_account_update(
+        parse_account_update_positions(flat_event),
+        flat_event,
+    )
+
+    assert service.current_position is None
+    assert service.order_executor.close_pending is False
+    assert service.order_executor.close_confirmed == 1
+    assert service.order_executor.cancel_calls == ["BTCUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_user_data_account_update_ignores_other_symbols():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.position_tracker = PositionTracker("BTCUSDT")
+
+    async def noop(payload):
+        return None
+
+    service.broadcast = noop
+
+    event = {
+        "e": "ACCOUNT_UPDATE",
+        "E": 1_700_000_002_000,
+        "a": {
+            "P": [
+                {
+                    "s": "ETHUSDT",
+                    "pa": "-0.1",
+                    "ep": "3200.0",
+                    "ps": "BOTH",
+                }
+            ]
+        },
+    }
+    from app.position import parse_account_update_positions
+
+    await service._on_user_data_account_update(
+        parse_account_update_positions(event),
+        event,
+    )
+
+    assert service.current_position is None
 
 
 @pytest.mark.asyncio

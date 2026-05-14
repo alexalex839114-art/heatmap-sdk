@@ -17,6 +17,7 @@ from app.assistant_config import AssistantRiskSettings, load_default_risk_settin
 from app.assistant_config import load_binance_account_settings
 from app.adaptive_service import AdaptiveMarketService
 from app.binance_account import BinanceAccountClient
+from app.binance_user_data import BinanceUserDataClient
 from app.entry_filter import AdaptiveVpinRegime, EntryFilterEngine
 from app.exit_engine import ExitEngine
 from app.order_executor import OrderExecutor
@@ -29,6 +30,7 @@ from app.settings import (
     HEATMAP_BUFFER_LEVELS,
     HEATMAP_HEIGHT,
     HEATMAP_RECENTER_MARGIN_LEVELS,
+    POSITION_REST_FALLBACK_INTERVAL_MS,
 )
 from app.trade_buffer import TradeBuffer
 
@@ -264,6 +266,7 @@ class LiveHeatmapService:
         self.account_client: BinanceAccountClient | None = None
         self.order_executor: OrderExecutor | None = None
         self.position_tracker: PositionTracker | None = None
+        self.user_data_client: BinanceUserDataClient | None = None
         self.current_position: PositionState | None = None
         self._last_entry_results: dict[str, dict[str, Any]] = {}
         self._last_auto_trade_ms: int = 0
@@ -360,6 +363,7 @@ class LiveHeatmapService:
             else:
                 self.account_client = None
                 self.order_executor = None
+            await self._start_user_data_stream()
             self.client = BinanceMarketClient(
                 symbol=symbol,
                 order_book=self.book,
@@ -446,12 +450,41 @@ class LiveHeatmapService:
                 await task
             setattr(self, attr, None)
 
+    async def _start_user_data_stream(self) -> None:
+        if self.account_client is None:
+            self.user_data_client = None
+            return
+        try:
+            client = BinanceUserDataClient(
+                self.account_client,
+                on_account_update=self._on_user_data_account_update,
+            )
+            await client.start()
+        except Exception as exc:  # noqa: BLE001
+            self.user_data_client = None
+            await self.broadcast(
+                {
+                    "type": "account_error",
+                    "message": f"user data stream unavailable: {exc}",
+                }
+            )
+            return
+        self.user_data_client = client
+
+    async def _stop_user_data_stream(self) -> None:
+        if self.user_data_client is None:
+            return
+        with suppress(Exception):
+            await self.user_data_client.stop()
+        self.user_data_client = None
+
     async def _disconnect_market(self) -> None:
         try:
             if self.client is not None:
                 await self.client.stop()
         finally:
             await self._stop_indicator_start_tasks()
+            await self._stop_user_data_stream()
             self.client = None
             self.adaptive_market = None
             self.entry_filter = None
@@ -996,10 +1029,98 @@ class LiveHeatmapService:
         symbol = self.session.symbol
         if symbol is None or self.account_client is None:
             return
-        if now_ms - self._last_position_poll_ms < FRAME_INTERVAL_MS:
+        if now_ms - self._last_position_poll_ms < POSITION_REST_FALLBACK_INTERVAL_MS:
             return
         self._last_position_poll_ms = now_ms
         await self._refresh_position(symbol, now_ms)
+
+    async def _on_user_data_account_update(
+        self,
+        positions: dict[str, PositionState],
+        event: dict[str, Any],
+    ) -> None:
+        symbol = self.session.symbol
+        if symbol is None or self.position_tracker is None:
+            return
+        # Binance ACCOUNT_UPDATE only includes positions that actually changed.
+        # If our symbol is absent, nothing about it has changed — leave state
+        # alone instead of clobbering it to flat.
+        position = positions.get(symbol.upper())
+        if position is None:
+            return
+        update_time = event.get("E")
+        if isinstance(update_time, (int, float)):
+            now_ms = int(update_time)
+        else:
+            now_ms = int(time.time() * 1000)
+        # User data events are authoritative; suppress fallback REST poll for
+        # at least one full fallback window after each push.
+        self._last_position_poll_ms = now_ms
+        await self._apply_position_update(symbol, position, now_ms)
+
+    async def _apply_position_update(
+        self,
+        symbol: str,
+        position: PositionState | None,
+        now_ms: int,
+    ) -> None:
+        if self.position_tracker is None:
+            return
+        realized_vol = 0.0
+        if self.adaptive_market is not None:
+            realized_vol = float(getattr(self.adaptive_market.state(), "realized_vol", 0.0))
+        tracked = self.position_tracker.update(
+            position,
+            now_ms,
+            realized_vol=realized_vol,
+            stop_rv_multiplier=self.session.assistant_settings.stop_rv_multiplier,
+            take_rv_multiplier=self.session.assistant_settings.take_rv_multiplier,
+        )
+        previous = self.current_position
+        self.current_position = tracked if tracked is not None and tracked.is_open else None
+        if (
+            self.current_position is not None
+            and self.order_executor is not None
+            and hasattr(self.order_executor, "mark_open_confirmed")
+        ):
+            self.order_executor.mark_open_confirmed()
+        elif (
+            tracked is not None
+            and not tracked.is_open
+            and self.order_executor is not None
+            and getattr(self.order_executor, "close_pending", False)
+        ):
+            await self._confirm_flat_close(symbol, now_ms)
+        if self.current_position is not None:
+            await self.broadcast(
+                {
+                    "type": "position",
+                    "symbol": self.current_position.symbol,
+                    "side": self.current_position.side,
+                    "quantity": self.current_position.quantity,
+                    "entry_price": self.current_position.entry_price,
+                    "unrealized_pnl": self.current_position.unrealized_pnl,
+                    "opened_at_ms": self.current_position.opened_at_ms,
+                    "realized_vol_at_entry": self.current_position.realized_vol_at_entry,
+                    "rv_stop_price": self.current_position.rv_stop_price,
+                    "rv_take_price": self.current_position.rv_take_price,
+                }
+            )
+        elif previous is not None:
+            await self.broadcast(
+                {
+                    "type": "position",
+                    "symbol": previous.symbol,
+                    "side": "FLAT",
+                    "quantity": 0.0,
+                    "entry_price": previous.entry_price,
+                    "unrealized_pnl": 0.0,
+                    "opened_at_ms": None,
+                    "realized_vol_at_entry": 0.0,
+                    "rv_stop_price": None,
+                    "rv_take_price": None,
+                }
+            )
 
     async def _refresh_position(
         self,
@@ -1033,6 +1154,7 @@ class LiveHeatmapService:
             and getattr(self.order_executor, "close_pending", False)
         ):
             await self._confirm_flat_close(symbol, now_ms)
+        self._last_position_poll_ms = now_ms
         return tracked
 
     async def _evaluate_exit(self, now_ms: int):
