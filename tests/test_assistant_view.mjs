@@ -141,11 +141,26 @@ test("confluenceVisualState waits when exchanges disagree", () => {
 
 import { multiExchangeVisualState } from "../static/assistant_view.js";
 
-test("multiExchangeVisualState reports x3 when all three exchanges agree", () => {
+test("multiExchangeVisualState reports x4 when all four exchanges agree", () => {
   const states = {
     binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     bybit: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     okx: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    gate: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+  };
+  assert.deepEqual(multiExchangeVisualState(states), {
+    mode: "buy",
+    label: "BUY x4",
+    reason: "Binance + Bybit + OKX + Gate",
+  });
+});
+
+test("multiExchangeVisualState reports x3 when three of four exchanges agree", () => {
+  const states = {
+    binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    bybit: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    okx: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    gate: null,
   };
   assert.deepEqual(multiExchangeVisualState(states), {
     mode: "buy",
@@ -159,6 +174,7 @@ test("multiExchangeVisualState falls back to x2 when only two exchanges agree", 
     binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     bybit: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     okx: { market_state: "READY", long_filter: "WAIT", short_filter: "WAIT", reason: "no_signal" },
+    gate: null,
   };
   assert.deepEqual(multiExchangeVisualState(states), {
     mode: "buy",
@@ -172,6 +188,7 @@ test("multiExchangeVisualState reports MIXED when buy and sell coexist", () => {
     binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     bybit: { market_state: "READY", long_filter: "WAIT", short_filter: "OK" },
     okx: null,
+    gate: null,
   };
   assert.deepEqual(multiExchangeVisualState(states), {
     mode: "wait",

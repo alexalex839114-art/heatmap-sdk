@@ -75,10 +75,11 @@ const EXCHANGE_LABELS = {
   binance: "Binance",
   bybit: "Bybit",
   okx: "OKX",
+  gate: "Gate",
 };
 
 export function multiExchangeVisualState(exchangeStates) {
-  const order = ["binance", "bybit", "okx"];
+  const order = ["binance", "bybit", "okx", "gate"];
   const visuals = order.map((name) => ({
     name,
     visual: signalVisualState(exchangeStates?.[name]),

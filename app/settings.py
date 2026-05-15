@@ -25,3 +25,15 @@ BYBIT_REST_URL = "https://api.bybit.com"
 COINBASE_ADVANCED_WS_URL = "wss://advanced-trade-ws.coinbase.com"
 KRAKEN_PUBLIC_WS_V2_URL = "wss://ws.kraken.com/v2"
 OKX_PUBLIC_WS_V5_URL = "wss://ws.okx.com:8443/ws/v5/public"
+# Gate.io v4 public WebSocket for USDT-margined perpetual futures (linear).
+# The same endpoint accepts BTC_USDT, ETH_USDT, IRYS_USDT, etc. — Gate uses the
+# `BASE_QUOTE` contract id convention with an underscore.
+GATE_FUTURES_USDT_PUBLIC_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+# Gate.io order book depth requested on the `futures.order_book` channel.
+# The channel pushes full snapshots at the configured frequency, so a smaller
+# level (10..20) keeps the message size predictable while still giving the
+# adaptive market service enough top-of-book context.
+GATE_ORDER_BOOK_LEVEL = "20"
+# Gate.io order book push interval ("0" means default / fastest = 100ms,
+# "100ms", "1000ms" are also accepted by the `futures.order_book` channel).
+GATE_ORDER_BOOK_INTERVAL = "0"

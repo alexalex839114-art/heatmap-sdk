@@ -89,3 +89,28 @@ def to_okx_inst_id(symbol: str) -> str | None:
     else:
         mapped_quote = quote
     return f"{base}-{mapped_quote}-SWAP"
+
+
+def to_gate_contract(symbol: str) -> str | None:
+    """Map 'BTCUSDT' to a Gate.io USDT-margined **perpetual** contract id.
+
+    Gate.io futures use the ``<BASE>_<QUOTE>`` underscore convention (e.g.
+    ``BTC_USDT``, ``ETH_USDT``, ``IRYS_USDT``), all served from the same
+    USDT-margined linear perp WebSocket endpoint.
+
+    USDC-quoted Binance symbols are not currently listed as USDT-margined
+    perps on Gate, so we still emit ``<BASE>_USDC`` and let the client report
+    the contract as ``unavailable`` when Gate rejects it. Any other quote is
+    passed through unchanged.
+    """
+    parts = split_symbol(symbol)
+    if parts is None:
+        return None
+    base, quote = parts
+    if quote in {"USDT", "USD", "BUSD", "FDUSD"}:
+        mapped_quote = "USDT"
+    elif quote == "USDC":
+        mapped_quote = "USDC"
+    else:
+        mapped_quote = quote
+    return f"{base}_{mapped_quote}"

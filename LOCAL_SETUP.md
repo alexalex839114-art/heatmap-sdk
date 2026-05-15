@@ -2,16 +2,16 @@
 
 Эта сборка содержит:
 - **PR #2** — позиция через Binance user-data WebSocket, REST-поллинг снижен до 10 с (fallback), race-condition закрыт watermark-проверкой.
-- **PR #3** — Coinbase и Kraken отключены (код не удалён, методы остались для будущей реактивации), вместо них подключён **OKX перпы (SWAP)** — `BTC-USDT-SWAP` и т.п., линейный USDT-маржинальный perpetual, прямой аналог Binance USDⓈ-M Futures. UI показывает три половинки: `BIN / BYB / OKX`.
-- **Graceful fallback для отсутствующих perp'ов:** если конкретный символ не листится на OKX (например `IRYSUSDT` → OKX не имеет `IRYS-USDT-SWAP`), индикатор уходит в состояние `unavailable` без падения. Confluence считается только по BIN+BYB, остальное продолжает работать.
+- **PR #3** — Coinbase и Kraken отключены (код не удалён, методы остались для будущей реактивации), вместо них подключены **OKX перпы (SWAP)** — `BTC-USDT-SWAP` и т.п., линейный USDT-маржинальный perpetual, прямой аналог Binance USDⓈ-M Futures, и **Gate.io USDT-маржинальные перпы** — `BTC_USDT`, `ETH_USDT` и т.п. UI показывает четыре половинки: `BIN / BYB / OKX / GATE`.
+- **Graceful fallback для отсутствующих perp'ов:** если конкретный символ не листится на OKX (например `IRYSUSDT` → OKX не имеет `IRYS-USDT-SWAP`) или на Gate, соответствующий индикатор уходит в состояние `unavailable` без падения. Confluence продолжает считаться по оставшимся биржам. (Часто `IRYSUSDT` есть на Gate, но нет на OKX — тогда работает BIN+BYB+GATE.)
 
-Все 200 Python-тестов и 26 JS-тестов зелёные локально.
+Все 212 Python-тестов и 27 JS-тестов зелёные локально.
 
 ## Требования
 
 - Windows 10/11 с PowerShell 5+ (стандартный).
 - **Python 3.10+** (тестировано на 3.12). Проверь: `python --version`.
-- Доступ в интернет (порт 443 — для Binance / Bybit / OKX WebSocket).
+- Доступ в интернет (порт 443 — для Binance / Bybit / OKX / Gate.io WebSocket).
 - Свободный TCP-порт 8000 на `127.0.0.1` (скрипт сам найдёт следующий свободный, если занят).
 
 ## 1. Получить код
@@ -61,18 +61,18 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 
 Открой в браузере: **http://127.0.0.1:8000**
 
-Логи остаются в консоли — там видно подключения к Binance/Bybit/OKX, listen key Binance, и поток `position`-эвентов.
+Логи остаются в консоли — там видно подключения к Binance/Bybit/OKX/Gate, listen key Binance, и поток `position`-эвентов.
 
 ## 4. Смоук-чек (что должно работать)
 
 1. В поле `Symbol` ввести `BTCUSDT`, `Compression = 1`, нажать **Connect WS**.
 2. В строке статуса (внизу слева) должна появиться надпись `live_ready` (в пределах ~10–20 сек).
 3. Нажать **Start Heatmap** — справа налево пойдёт прокрутка тепловой карты.
-4. **Signal-lights** (под кнопкой) — три ряда (BUY / WAIT / SELL), в каждом ряду три половинки с подписями **BIN / BYB / OKX**. Никаких CB или KR быть не должно.
-   - Для популярных символов (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`) OKX-половинка зажигается через секунды.
-   - Для редких альтов, у которых на OKX нет перпа (напр. `IRYSUSDT`), OKX-половинка остаётся неактивной, а в детальной строке индикатора будет `OKX: unavailable BTC-USDT-SWAP (OKX does not list ... ; confluence uses Binance + Bybit only)`. Это **ожидаемое поведение**, не ошибка.
+4. **Signal-lights** (под кнопкой) — три ряда (BUY / WAIT / SELL), в каждом ряду четыре половинки с подписями **BIN / BYB / OKX / GATE**. Никаких CB или KR быть не должно.
+   - Для популярных символов (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`) все четыре половинки зажигаются через секунды.
+   - Для редких альтов, у которых нет перпа на конкретной бирже (напр. `IRYSUSDT` отсутствует на OKX, но есть на Gate), эта половинка остаётся неактивной, а в детальной строке индикатора будет `OKX: unavailable IRYS-USDT-SWAP (OKX does not list ...; confluence uses Binance + Bybit only)`. Confluence считается по оставшимся биржам. Это **ожидаемое поведение**, не ошибка.
 5. Половинки начинают подсвечиваться по мере того, как каждая биржа доходит до `ready`. Если какая-то долго в `warming` — нормально, ассистент ждёт прогрева VPIN.
-6. В правой панели "Indicators" пойдут блоки от трёх бирж: `binance`, `bybit`, `okx`. **Никаких `coinbase` / `kraken`** в списке быть не должно.
+6. В правой панели "Indicators" пойдут блоки от четырёх бирж: `binance`, `bybit`, `okx`, `gate`. **Никаких `coinbase` / `kraken`** в списке быть не должно.
 
 ### Проверка PR #2 (user-data WS)
 
@@ -80,12 +80,12 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 - В консоли uvicorn должна появиться запись `account update received` (или похожая) практически сразу после изменения позиции на бирже.
 - Можно намеренно "уронить" сеть на пару секунд — REST-fallback подхватит через ~10 сек.
 
-### Проверка PR #3 (OKX вместо Coinbase/Kraken)
+### Проверка PR #3 (OKX и Gate вместо Coinbase/Kraken)
 
 - В консоли uvicorn не должно быть строк, начинающихся с `coinbase` / `kraken` (старт индикаторов).
-- В DevTools → Network → WS видно событие `indicator_status` от `okx`:
+- В DevTools → Network → WS видно события `indicator_status` от `okx` и `gate`:
   - `state: "ready"` для популярных символов (`BTCUSDT`, `ETHUSDT`).
-  - `state: "unavailable"` для редких альтов, которых на OKX нет (`IRYSUSDT` и подобные).
+  - `state: "unavailable"` для редких альтов, которых на этой бирже нет (например `IRYSUSDT` сейчас отсутствует на OKX, но есть на Gate).
   - `state: "error"` — только если действительно проблема с подключением (firewall, сеть).
 - В UI правая колонка "Indicators" показывает blocks для `okx` с теми же полями, что и для `binance` / `bybit` (state, vpin, conf и т.п.) — но только когда OKX в `ready` и начал считать VPIN.
 

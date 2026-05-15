@@ -13,7 +13,13 @@ from app.bybit_client import BybitMarketClient
 from app.coinbase_client import CoinbaseMarketClient
 from app.kraken_client import KrakenMarketClient
 from app.okx_client import OkxMarketClient, OkxUnsupportedInstrumentError
-from app.exchange_symbols import to_coinbase_product, to_kraken_pair, to_okx_inst_id
+from app.gate_client import GateMarketClient, GateUnsupportedContractError
+from app.exchange_symbols import (
+    to_coinbase_product,
+    to_kraken_pair,
+    to_okx_inst_id,
+    to_gate_contract,
+)
 from app.assistant_config import AssistantRiskSettings, load_default_risk_settings
 from app.assistant_config import load_binance_account_settings
 from app.adaptive_service import AdaptiveMarketService
@@ -269,6 +275,14 @@ class LiveHeatmapService:
             block_on_toxic_vpin=False,
             vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
         )
+        self.gate_book = OrderBook()
+        self.gate_trade_buffer = TradeBuffer()
+        self.gate_client: GateMarketClient | None = None
+        self.gate_adaptive_market: AdaptiveMarketService | None = None
+        self.gate_entry_filter: EntryFilterEngine | None = EntryFilterEngine(
+            block_on_toxic_vpin=False,
+            vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
+        )
         self._coinbase_start_task: asyncio.Task | None = None
         self._kraken_start_task: asyncio.Task | None = None
         self._okx_start_task: asyncio.Task | None = None
@@ -347,6 +361,8 @@ class LiveHeatmapService:
             self.kraken_trade_buffer = TradeBuffer()
             self.okx_book = OrderBook()
             self.okx_trade_buffer = TradeBuffer()
+            self.gate_book = OrderBook()
+            self.gate_trade_buffer = TradeBuffer()
             self._last_entry_results = {}
             self._last_auto_trade_ms = 0
             self.frame_builder = None
@@ -358,6 +374,7 @@ class LiveHeatmapService:
             self.coinbase_adaptive_market = None
             self.kraken_adaptive_market = None
             self.okx_adaptive_market = None
+            self.gate_adaptive_market = None
             self._apply_assistant_market_settings()
             self.entry_filter = EntryFilterEngine(
                 block_on_toxic_vpin=False,
@@ -370,6 +387,10 @@ class LiveHeatmapService:
             self.coinbase_entry_filter = None
             self.kraken_entry_filter = None
             self.okx_entry_filter = EntryFilterEngine(
+                block_on_toxic_vpin=False,
+                vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
+            )
+            self.gate_entry_filter = EntryFilterEngine(
                 block_on_toxic_vpin=False,
                 vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
             )
@@ -408,12 +429,17 @@ class LiveHeatmapService:
                 return
 
             await self._stop_indicator_start_tasks()
-            # Coinbase/Kraken indicators are disabled by request; only OKX is
-            # scheduled here. The Coinbase/Kraken start methods are still
-            # present in this module but no longer invoked.
+            # Coinbase/Kraken indicators are disabled by request; the third
+            # and fourth slots are OKX (perpetual SWAP) and Gate (USDT-margined
+            # perpetual). The Coinbase/Kraken start methods are still present
+            # in this module but no longer invoked.
             self._okx_start_task = asyncio.create_task(
                 self._start_okx_indicator(symbol),
                 name="okx-indicator-start",
+            )
+            self._gate_start_task = asyncio.create_task(
+                self._start_gate_indicator(symbol),
+                name="gate-indicator-start",
             )
 
             self.frame_builder = FrameBuilder(
@@ -458,7 +484,12 @@ class LiveHeatmapService:
         self._position_poll_task = None
 
     async def _stop_indicator_start_tasks(self) -> None:
-        for attr in ("_coinbase_start_task", "_kraken_start_task", "_okx_start_task"):
+        for attr in (
+            "_coinbase_start_task",
+            "_kraken_start_task",
+            "_okx_start_task",
+            "_gate_start_task",
+        ):
             task: asyncio.Task | None = getattr(self, attr, None)
             if task is None:
                 continue
@@ -529,6 +560,12 @@ class LiveHeatmapService:
             self.okx_client = None
             self.okx_adaptive_market = None
             self.okx_entry_filter = None
+            if self.gate_client is not None:
+                with suppress(Exception):
+                    await self.gate_client.stop()
+            self.gate_client = None
+            self.gate_adaptive_market = None
+            self.gate_entry_filter = None
             self.exit_engine = None
             self.account_client = None
             self.order_executor = None
@@ -852,6 +889,30 @@ class LiveHeatmapService:
         self.okx_adaptive_market.on_agg_trade(trade)
         self._schedule_assistant_snapshot()
 
+    def _on_gate_market_trade(self, trade: dict[str, Any]) -> None:
+        if self.gate_adaptive_market is None:
+            return
+        self.gate_adaptive_market.on_agg_trade(trade)
+        self._schedule_assistant_snapshot()
+
+    def _on_gate_book_update(self, book: OrderBook, event_time_ms: int | None) -> None:
+        if self.gate_adaptive_market is None:
+            return
+        best_bid = book.best_bid()
+        best_ask = book.best_ask()
+        if best_bid is None or best_ask is None:
+            return
+        bid_vol = book.bids.get(best_bid, 0.0)
+        ask_vol = book.asks.get(best_ask, 0.0)
+        self.gate_adaptive_market.on_top_of_book(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            bid_volume=bid_vol,
+            ask_volume=ask_vol,
+            event_time_ms=event_time_ms,
+        )
+        self._schedule_assistant_snapshot()
+
     def _on_okx_book_update(self, book: OrderBook, event_time_ms: int | None) -> None:
         if self.okx_adaptive_market is None:
             return
@@ -1069,6 +1130,85 @@ class LiveHeatmapService:
             }
         )
 
+    async def _start_gate_indicator(self, symbol: str) -> None:
+        contract = to_gate_contract(symbol)
+        if contract is None:
+            self.gate_client = None
+            self.gate_adaptive_market = None
+            self.gate_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "gate",
+                    "state": "unavailable",
+                    "message": f"no Gate contract for {symbol}",
+                }
+            )
+            return
+        self.gate_adaptive_market = AdaptiveMarketService(contract)
+        self._apply_assistant_market_settings()
+        await self.broadcast(
+            {
+                "type": "indicator_status",
+                "exchange": "gate",
+                "state": "connecting",
+                "product": contract,
+            }
+        )
+        client = GateMarketClient(
+            contract=contract,
+            order_book=self.gate_book,
+            trade_buffer=self.gate_trade_buffer,
+            on_trade=self._on_gate_market_trade,
+            on_book_update=self._on_gate_book_update,
+        )
+        try:
+            await client.start(sync_timeout=60.0)
+        except GateUnsupportedContractError as exc:
+            with suppress(Exception):
+                await client.stop()
+            self.gate_client = None
+            self.gate_adaptive_market = None
+            self.gate_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "gate",
+                    "state": "unavailable",
+                    "product": contract,
+                    "message": (
+                        f"Gate does not list {contract}; confluence proceeds without Gate"
+                    ),
+                    "detail": str(exc),
+                }
+            )
+            return
+        except Exception as exc:
+            with suppress(Exception):
+                await client.stop()
+            self.gate_client = None
+            self.gate_adaptive_market = None
+            self.gate_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "gate",
+                    "state": "error",
+                    "product": contract,
+                    "message": str(exc) or type(exc).__name__,
+                }
+            )
+            return
+        self.gate_client = client
+        await self.broadcast(
+            {
+                "type": "indicator_status",
+                "exchange": "gate",
+                "state": "ready",
+                "product": contract,
+            }
+        )
+
     def _schedule_assistant_snapshot(self) -> None:
         now_ms = int(time.time() * 1000)
         if now_ms - self._last_assistant_broadcast_ms < 500:
@@ -1084,6 +1224,7 @@ class LiveHeatmapService:
             self.coinbase_adaptive_market,
             self.kraken_adaptive_market,
             self.okx_adaptive_market,
+            self.gate_adaptive_market,
         ):
             if market is None:
                 continue
@@ -1493,6 +1634,12 @@ class LiveHeatmapService:
             "okx",
             self.okx_adaptive_market,
             self.okx_entry_filter,
+            now_ms=now_ms,
+        )
+        await self._broadcast_indicator_entry_filter(
+            "gate",
+            self.gate_adaptive_market,
+            self.gate_entry_filter,
             now_ms=now_ms,
         )
         if self.trading_state in TRADING_ACTIVE_STATES:

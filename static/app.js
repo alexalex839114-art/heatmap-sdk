@@ -51,11 +51,13 @@ const exchangeSignals = {
   binance: null,
   bybit: null,
   okx: null,
+  gate: null,
 };
 const exchangeStatus = {
   binance: null,
   bybit: null,
   okx: null,
+  gate: null,
 };
 
 function setStatus(text) {
@@ -100,9 +102,10 @@ function setSignalVisual(payload) {
     formatDetailLine("binance", "BIN"),
     formatDetailLine("bybit", "BYB"),
     formatDetailLine("okx", "OKX"),
+    formatDetailLine("gate", "GATE"),
   ].join("\n");
 
-  for (const name of ["binance", "bybit", "okx"]) {
+  for (const name of ["binance", "bybit", "okx", "gate"]) {
     updateExchangeHalf(name, signalVisualState(exchangeSignals[name]));
   }
 }
