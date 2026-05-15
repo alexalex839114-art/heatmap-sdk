@@ -50,14 +50,12 @@ let tradingActive = false;
 const exchangeSignals = {
   binance: null,
   bybit: null,
-  coinbase: null,
-  kraken: null,
+  okx: null,
 };
 const exchangeStatus = {
   binance: null,
   bybit: null,
-  coinbase: null,
-  kraken: null,
+  okx: null,
 };
 
 function setStatus(text) {
@@ -101,11 +99,10 @@ function setSignalVisual(payload) {
   signalDetailNode.textContent = [
     formatDetailLine("binance", "BIN"),
     formatDetailLine("bybit", "BYB"),
-    formatDetailLine("coinbase", "CB "),
-    formatDetailLine("kraken", "KR "),
+    formatDetailLine("okx", "OKX"),
   ].join("\n");
 
-  for (const name of ["binance", "bybit", "coinbase", "kraken"]) {
+  for (const name of ["binance", "bybit", "okx"]) {
     updateExchangeHalf(name, signalVisualState(exchangeSignals[name]));
   }
 }

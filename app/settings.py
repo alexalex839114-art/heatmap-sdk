@@ -20,5 +20,8 @@ POSITION_REST_FALLBACK_INTERVAL_MS = 10_000
 LISTEN_KEY_KEEPALIVE_INTERVAL_MS = 30 * 60 * 1000
 BYBIT_LINEAR_PUBLIC_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 BYBIT_REST_URL = "https://api.bybit.com"
+# Coinbase and Kraken clients remain in the codebase but their connections are
+# disabled — the third indicator slot is now OKX.
 COINBASE_ADVANCED_WS_URL = "wss://advanced-trade-ws.coinbase.com"
 KRAKEN_PUBLIC_WS_V2_URL = "wss://ws.kraken.com/v2"
+OKX_PUBLIC_WS_V5_URL = "wss://ws.okx.com:8443/ws/v5/public"

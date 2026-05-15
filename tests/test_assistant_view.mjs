@@ -141,17 +141,16 @@ test("confluenceVisualState waits when exchanges disagree", () => {
 
 import { multiExchangeVisualState } from "../static/assistant_view.js";
 
-test("multiExchangeVisualState reports x4 when all four exchanges agree", () => {
+test("multiExchangeVisualState reports x3 when all three exchanges agree", () => {
   const states = {
     binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     bybit: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
-    coinbase: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
-    kraken: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    okx: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
   };
   assert.deepEqual(multiExchangeVisualState(states), {
     mode: "buy",
-    label: "BUY x4",
-    reason: "Binance + Bybit + Coinbase + Kraken",
+    label: "BUY x3",
+    reason: "Binance + Bybit + OKX",
   });
 });
 
@@ -159,8 +158,7 @@ test("multiExchangeVisualState falls back to x2 when only two exchanges agree", 
   const states = {
     binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     bybit: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
-    coinbase: null,
-    kraken: { market_state: "READY", long_filter: "WAIT", short_filter: "WAIT", reason: "no_signal" },
+    okx: { market_state: "READY", long_filter: "WAIT", short_filter: "WAIT", reason: "no_signal" },
   };
   assert.deepEqual(multiExchangeVisualState(states), {
     mode: "buy",
@@ -173,8 +171,7 @@ test("multiExchangeVisualState reports MIXED when buy and sell coexist", () => {
   const states = {
     binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     bybit: { market_state: "READY", long_filter: "WAIT", short_filter: "OK" },
-    coinbase: null,
-    kraken: null,
+    okx: null,
   };
   assert.deepEqual(multiExchangeVisualState(states), {
     mode: "wait",

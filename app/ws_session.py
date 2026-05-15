@@ -12,7 +12,8 @@ from app.binance_client import BinanceMarketClient
 from app.bybit_client import BybitMarketClient
 from app.coinbase_client import CoinbaseMarketClient
 from app.kraken_client import KrakenMarketClient
-from app.exchange_symbols import to_coinbase_product, to_kraken_pair
+from app.okx_client import OkxMarketClient
+from app.exchange_symbols import to_coinbase_product, to_kraken_pair, to_okx_inst_id
 from app.assistant_config import AssistantRiskSettings, load_default_risk_settings
 from app.assistant_config import load_binance_account_settings
 from app.adaptive_service import AdaptiveMarketService
@@ -260,8 +261,17 @@ class LiveHeatmapService:
             block_on_toxic_vpin=False,
             vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
         )
+        self.okx_book = OrderBook()
+        self.okx_trade_buffer = TradeBuffer()
+        self.okx_client: OkxMarketClient | None = None
+        self.okx_adaptive_market: AdaptiveMarketService | None = None
+        self.okx_entry_filter: EntryFilterEngine | None = EntryFilterEngine(
+            block_on_toxic_vpin=False,
+            vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
+        )
         self._coinbase_start_task: asyncio.Task | None = None
         self._kraken_start_task: asyncio.Task | None = None
+        self._okx_start_task: asyncio.Task | None = None
         self.exit_engine: ExitEngine | None = ExitEngine()
         self.account_client: BinanceAccountClient | None = None
         self.order_executor: OrderExecutor | None = None
@@ -335,13 +345,19 @@ class LiveHeatmapService:
             self.coinbase_trade_buffer = TradeBuffer()
             self.kraken_book = OrderBook()
             self.kraken_trade_buffer = TradeBuffer()
+            self.okx_book = OrderBook()
+            self.okx_trade_buffer = TradeBuffer()
             self._last_entry_results = {}
             self._last_auto_trade_ms = 0
             self.frame_builder = None
             self.adaptive_market = AdaptiveMarketService(symbol)
             self.bybit_adaptive_market = AdaptiveMarketService(symbol)
+            # Coinbase and Kraken indicators are intentionally disabled —
+            # OKX takes their place. Their clients/code are kept in the tree
+            # so they can be re-enabled later without re-implementation.
             self.coinbase_adaptive_market = None
             self.kraken_adaptive_market = None
+            self.okx_adaptive_market = None
             self._apply_assistant_market_settings()
             self.entry_filter = EntryFilterEngine(
                 block_on_toxic_vpin=False,
@@ -351,11 +367,9 @@ class LiveHeatmapService:
                 block_on_toxic_vpin=False,
                 vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
             )
-            self.coinbase_entry_filter = EntryFilterEngine(
-                block_on_toxic_vpin=False,
-                vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
-            )
-            self.kraken_entry_filter = EntryFilterEngine(
+            self.coinbase_entry_filter = None
+            self.kraken_entry_filter = None
+            self.okx_entry_filter = EntryFilterEngine(
                 block_on_toxic_vpin=False,
                 vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
             )
@@ -394,13 +408,12 @@ class LiveHeatmapService:
                 return
 
             await self._stop_indicator_start_tasks()
-            self._coinbase_start_task = asyncio.create_task(
-                self._start_coinbase_indicator(symbol),
-                name="coinbase-indicator-start",
-            )
-            self._kraken_start_task = asyncio.create_task(
-                self._start_kraken_indicator(symbol),
-                name="kraken-indicator-start",
+            # Coinbase/Kraken indicators are disabled by request; only OKX is
+            # scheduled here. The Coinbase/Kraken start methods are still
+            # present in this module but no longer invoked.
+            self._okx_start_task = asyncio.create_task(
+                self._start_okx_indicator(symbol),
+                name="okx-indicator-start",
             )
 
             self.frame_builder = FrameBuilder(
@@ -445,7 +458,7 @@ class LiveHeatmapService:
         self._position_poll_task = None
 
     async def _stop_indicator_start_tasks(self) -> None:
-        for attr in ("_coinbase_start_task", "_kraken_start_task"):
+        for attr in ("_coinbase_start_task", "_kraken_start_task", "_okx_start_task"):
             task: asyncio.Task | None = getattr(self, attr, None)
             if task is None:
                 continue
@@ -510,6 +523,12 @@ class LiveHeatmapService:
             self.kraken_client = None
             self.kraken_adaptive_market = None
             self.kraken_entry_filter = None
+            if self.okx_client is not None:
+                with suppress(Exception):
+                    await self.okx_client.stop()
+            self.okx_client = None
+            self.okx_adaptive_market = None
+            self.okx_entry_filter = None
             self.exit_engine = None
             self.account_client = None
             self.order_executor = None
@@ -827,6 +846,30 @@ class LiveHeatmapService:
         )
         self._schedule_assistant_snapshot()
 
+    def _on_okx_market_trade(self, trade: dict[str, Any]) -> None:
+        if self.okx_adaptive_market is None:
+            return
+        self.okx_adaptive_market.on_agg_trade(trade)
+        self._schedule_assistant_snapshot()
+
+    def _on_okx_book_update(self, book: OrderBook, event_time_ms: int | None) -> None:
+        if self.okx_adaptive_market is None:
+            return
+        best_bid = book.best_bid()
+        best_ask = book.best_ask()
+        if best_bid is None or best_ask is None:
+            return
+        bid_vol = book.bids.get(best_bid, 0.0)
+        ask_vol = book.asks.get(best_ask, 0.0)
+        self.okx_adaptive_market.on_top_of_book(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            bid_vol=bid_vol,
+            ask_vol=ask_vol,
+            timestamp_ms=event_time_ms,
+        )
+        self._schedule_assistant_snapshot()
+
     async def _start_coinbase_indicator(self, symbol: str) -> None:
         product_id = to_coinbase_product(symbol)
         if product_id is None:
@@ -947,6 +990,66 @@ class LiveHeatmapService:
             }
         )
 
+    async def _start_okx_indicator(self, symbol: str) -> None:
+        inst_id = to_okx_inst_id(symbol)
+        if inst_id is None:
+            self.okx_client = None
+            self.okx_adaptive_market = None
+            self.okx_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "okx",
+                    "state": "unavailable",
+                    "message": f"no OKX instrument for {symbol}",
+                }
+            )
+            return
+        self.okx_adaptive_market = AdaptiveMarketService(inst_id)
+        self._apply_assistant_market_settings()
+        await self.broadcast(
+            {
+                "type": "indicator_status",
+                "exchange": "okx",
+                "state": "connecting",
+                "product": inst_id,
+            }
+        )
+        client = OkxMarketClient(
+            inst_id=inst_id,
+            order_book=self.okx_book,
+            trade_buffer=self.okx_trade_buffer,
+            on_trade=self._on_okx_market_trade,
+            on_book_update=self._on_okx_book_update,
+        )
+        try:
+            await client.start(sync_timeout=60.0)
+        except Exception as exc:
+            with suppress(Exception):
+                await client.stop()
+            self.okx_client = None
+            self.okx_adaptive_market = None
+            self.okx_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "okx",
+                    "state": "error",
+                    "product": inst_id,
+                    "message": str(exc) or type(exc).__name__,
+                }
+            )
+            return
+        self.okx_client = client
+        await self.broadcast(
+            {
+                "type": "indicator_status",
+                "exchange": "okx",
+                "state": "ready",
+                "product": inst_id,
+            }
+        )
+
     def _schedule_assistant_snapshot(self) -> None:
         now_ms = int(time.time() * 1000)
         if now_ms - self._last_assistant_broadcast_ms < 500:
@@ -961,6 +1064,7 @@ class LiveHeatmapService:
             self.bybit_adaptive_market,
             self.coinbase_adaptive_market,
             self.kraken_adaptive_market,
+            self.okx_adaptive_market,
         ):
             if market is None:
                 continue
@@ -1363,16 +1467,13 @@ class LiveHeatmapService:
                     "vpin": result.vpin,
                 }
             )
+        # Coinbase + Kraken indicator broadcasts are intentionally suppressed
+        # — OKX has replaced them in the UI. The helper still exists and the
+        # client code is preserved in case either is re-enabled in the future.
         await self._broadcast_indicator_entry_filter(
-            "coinbase",
-            self.coinbase_adaptive_market,
-            self.coinbase_entry_filter,
-            now_ms=now_ms,
-        )
-        await self._broadcast_indicator_entry_filter(
-            "kraken",
-            self.kraken_adaptive_market,
-            self.kraken_entry_filter,
+            "okx",
+            self.okx_adaptive_market,
+            self.okx_entry_filter,
             now_ms=now_ms,
         )
         if self.trading_state in TRADING_ACTIVE_STATES:

@@ -74,12 +74,11 @@ export function confluenceVisualState(exchangeStates) {
 const EXCHANGE_LABELS = {
   binance: "Binance",
   bybit: "Bybit",
-  coinbase: "Coinbase",
-  kraken: "Kraken",
+  okx: "OKX",
 };
 
 export function multiExchangeVisualState(exchangeStates) {
-  const order = ["binance", "bybit", "coinbase", "kraken"];
+  const order = ["binance", "bybit", "okx"];
   const visuals = order.map((name) => ({
     name,
     visual: signalVisualState(exchangeStates?.[name]),

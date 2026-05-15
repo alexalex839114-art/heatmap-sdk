@@ -59,3 +59,16 @@ def to_kraken_pair(symbol: str) -> str | None:
     else:
         mapped_quote = quote
     return f"{base}/{mapped_quote}"
+
+
+def to_okx_inst_id(symbol: str) -> str | None:
+    """Map 'BTCUSDT' to OKX spot ``instId`` ``BTC-USDT``.
+
+    OKX natively lists USDT, USDC and USD spot pairs, so the quote is passed
+    through unchanged (no USDT -> USD remapping like Coinbase/Kraken).
+    """
+    parts = split_symbol(symbol)
+    if parts is None:
+        return None
+    base, quote = parts
+    return f"{base}-{quote}"
