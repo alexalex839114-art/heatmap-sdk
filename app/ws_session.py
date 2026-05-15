@@ -907,9 +907,9 @@ class LiveHeatmapService:
         self.gate_adaptive_market.on_top_of_book(
             best_bid=best_bid,
             best_ask=best_ask,
-            bid_volume=bid_vol,
-            ask_volume=ask_vol,
-            event_time_ms=event_time_ms,
+            bid_vol=bid_vol,
+            ask_vol=ask_vol,
+            timestamp_ms=event_time_ms,
         )
         self._schedule_assistant_snapshot()
 

@@ -1227,3 +1227,51 @@ async def test_emergency_flatten_cancels_orders_and_closes_open_position():
     assert event["state"] == "STOPPED"
     assert service.order_executor.cancel_calls == ["BTCUSDT"]
     assert service.order_executor.close_calls == [service.current_position]
+
+
+@pytest.mark.asyncio
+async def test_on_gate_book_update_uses_correct_kwargs_for_adaptive_market():
+    """Regression: _on_gate_book_update must call on_top_of_book with bid_vol/ask_vol
+    and timestamp_ms — not bid_volume/ask_volume/event_time_ms. The wrong kwargs
+    raise TypeError on the first book event, which would silently kill the Gate
+    WS stream task and leave the indicator stuck in WARMING with 0 trades."""
+    service = LiveHeatmapService()
+    service.gate_adaptive_market = AdaptiveMarketService("BTC_USDT")
+    from app.order_book import OrderBook
+
+    book = OrderBook()
+    book.bids[80000.0] = 3.0
+    book.asks[80001.0] = 1.0
+
+    # Must not raise — bug was: wrong kwargs raised TypeError, killing stream.
+    service._on_gate_book_update(book, event_time_ms=1_700_000_000_000)
+
+    # OBI = (bid_vol - ask_vol) / (bid_vol + ask_vol) = (3 - 1) / 4 = 0.5
+    assert service.gate_adaptive_market.last_obi == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_on_gate_market_trade_increments_trade_count():
+    service = LiveHeatmapService()
+    service.gate_adaptive_market = AdaptiveMarketService("BTC_USDT")
+
+    service._on_gate_market_trade(
+        {
+            "symbol": "BTC_USDT",
+            "price": 80000.0,
+            "qty": 1.0,
+            "timestamp": 1_700_000_000_000,
+            "is_buyer_maker": False,
+        }
+    )
+    service._on_gate_market_trade(
+        {
+            "symbol": "BTC_USDT",
+            "price": 80001.0,
+            "qty": 0.5,
+            "timestamp": 1_700_000_000_500,
+            "is_buyer_maker": True,
+        }
+    )
+
+    assert service.gate_adaptive_market.trade_count == 2
