@@ -271,6 +271,11 @@ class LiveHeatmapService:
         self._last_entry_results: dict[str, dict[str, Any]] = {}
         self._last_auto_trade_ms: int = 0
         self._last_position_poll_ms: int = 0
+        # Timestamp (event-time "E" from Binance) of the most recent
+        # ACCOUNT_UPDATE that touched the active symbol. Used to detect when a
+        # slow REST /positionRisk response would clobber a fresher user-data
+        # push and discard it.
+        self._last_ws_position_update_ms: int = 0
         self._last_assistant_broadcast_ms: int = 0
         self._position_poll_task: asyncio.Task | None = None
         self.trading_state = "OFF"
@@ -513,6 +518,7 @@ class LiveHeatmapService:
             self._last_entry_results = {}
             self._last_auto_trade_ms = 0
             self._last_position_poll_ms = 0
+            self._last_ws_position_update_ms = 0
             self._last_assistant_broadcast_ms = 0
             await self._stop_position_poll_task()
             self.trading_state = "OFF"
@@ -1054,8 +1060,13 @@ class LiveHeatmapService:
         else:
             now_ms = int(time.time() * 1000)
         # User data events are authoritative; suppress fallback REST poll for
-        # at least one full fallback window after each push.
+        # at least one full fallback window after each push, and stamp the
+        # event time so an in-flight REST /positionRisk response cannot
+        # overwrite this state with older data.
         self._last_position_poll_ms = now_ms
+        self._last_ws_position_update_ms = max(
+            self._last_ws_position_update_ms, now_ms
+        )
         await self._apply_position_update(symbol, position, now_ms)
 
     async def _apply_position_update(
@@ -1129,7 +1140,25 @@ class LiveHeatmapService:
     ) -> PositionState | None:
         if self.account_client is None or self.position_tracker is None:
             return None
+        # Snapshot the latest user-data timestamp BEFORE the await so we can
+        # detect a WS push that landed during the in-flight REST call. If a
+        # newer ACCOUNT_UPDATE arrived while we were waiting, the REST
+        # response is stale by construction and must not be applied.
+        ws_seq_before = self._last_ws_position_update_ms
         position = await self.account_client.fetch_position(symbol)
+        if self._last_ws_position_update_ms > ws_seq_before:
+            return self.current_position
+        # Defence-in-depth: even when no WS push arrived during the await,
+        # the REST row itself may simply be older than the last WS event
+        # already applied (e.g. Binance edge-node clock skew). Skip in that
+        # case too.
+        rest_update_ms = position.update_time_ms if position is not None else None
+        if (
+            rest_update_ms is not None
+            and self._last_ws_position_update_ms > 0
+            and rest_update_ms < self._last_ws_position_update_ms
+        ):
+            return self.current_position
         realized_vol = 0.0
         if self.adaptive_market is not None:
             realized_vol = float(getattr(self.adaptive_market.state(), "realized_vol", 0.0))

@@ -260,6 +260,129 @@ async def test_refresh_position_updates_tracker():
 
 
 @pytest.mark.asyncio
+async def test_refresh_position_discards_stale_rest_after_ws_push():
+    """REST poll that suspends across a newer user-data ACCOUNT_UPDATE must
+    not overwrite the fresher WS state (Devin Review race fix)."""
+    service = LiveHeatmapService()
+    service.position_tracker = PositionTracker("BTCUSDT")
+    # Pre-seed an "open" position as if it had already been pushed via WS.
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000.0,
+    )
+    service.position_tracker.current = service.current_position
+
+    async def noop(payload):
+        return None
+
+    service.broadcast = noop
+
+    class FakeAccount:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetch_position(self, symbol):
+            self.calls += 1
+            # While the REST call is "in flight", simulate a newer WS push
+            # that already moved the position to flat.
+            service._last_ws_position_update_ms = 2_000
+            service.current_position = None
+            service.position_tracker.current = None
+            # Return stale REST data still showing the old open position.
+            return PositionState(
+                symbol=symbol,
+                amount=0.01,
+                entry_price=65000.0,
+                update_time_ms=1_500,
+            )
+
+    service.account_client = FakeAccount()
+
+    result = await service._refresh_position("BTCUSDT", now_ms=2_500)
+
+    # REST result must be discarded; position must remain flat as WS dictated.
+    assert service.current_position is None
+    # Returned value reflects the current (WS-driven) state, not the stale REST.
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_position_discards_rest_with_older_update_time():
+    """REST row whose own updateTime predates the last WS push is dropped
+    even when no concurrent task interleaving occurred."""
+    service = LiveHeatmapService()
+    service.position_tracker = PositionTracker("BTCUSDT")
+    service._last_ws_position_update_ms = 5_000
+    # Current position reflects the latest WS event (flat).
+    service.current_position = None
+
+    async def noop(payload):
+        return None
+
+    service.broadcast = noop
+
+    class FakeAccount:
+        async def fetch_position(self, symbol):
+            return PositionState(
+                symbol=symbol,
+                amount=0.02,
+                entry_price=65000.0,
+                update_time_ms=3_000,
+            )
+
+    service.account_client = FakeAccount()
+
+    result = await service._refresh_position("BTCUSDT", now_ms=6_000)
+
+    assert result is None
+    assert service.current_position is None
+
+
+@pytest.mark.asyncio
+async def test_user_data_account_update_advances_ws_timestamp():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.position_tracker = PositionTracker("BTCUSDT")
+
+    async def noop(payload):
+        return None
+
+    service.broadcast = noop
+
+    from app.position import parse_account_update_positions
+
+    event = {
+        "e": "ACCOUNT_UPDATE",
+        "E": 1_700_000_000_000,
+        "a": {
+            "P": [
+                {
+                    "s": "BTCUSDT",
+                    "pa": "0.01",
+                    "ep": "65000.0",
+                    "bep": "65010.0",
+                    "up": "0.0",
+                    "ps": "BOTH",
+                }
+            ]
+        },
+    }
+    await service._on_user_data_account_update(
+        parse_account_update_positions(event), event
+    )
+    assert service._last_ws_position_update_ms == 1_700_000_000_000
+
+    # An older event must not rewind the watermark.
+    older = dict(event)
+    older["E"] = 1_600_000_000_000
+    await service._on_user_data_account_update(
+        parse_account_update_positions(older), older
+    )
+    assert service._last_ws_position_update_ms == 1_700_000_000_000
+
+
+@pytest.mark.asyncio
 async def test_exit_evaluation_closes_position_once_on_hard_exit():
     service = LiveHeatmapService()
     service.session.assistant_settings = AssistantRiskSettings(
