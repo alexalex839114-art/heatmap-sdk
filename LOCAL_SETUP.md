@@ -2,9 +2,10 @@
 
 Эта сборка содержит:
 - **PR #2** — позиция через Binance user-data WebSocket, REST-поллинг снижен до 10 с (fallback), race-condition закрыт watermark-проверкой.
-- **PR #3** — Coinbase и Kraken отключены (код не удалён, методы остались для будущей реактивации), вместо них подключён OKX. UI показывает три половинки: `BIN / BYB / OKX`.
+- **PR #3** — Coinbase и Kraken отключены (код не удалён, методы остались для будущей реактивации), вместо них подключён **OKX перпы (SWAP)** — `BTC-USDT-SWAP` и т.п., линейный USDT-маржинальный perpetual, прямой аналог Binance USDⓈ-M Futures. UI показывает три половинки: `BIN / BYB / OKX`.
+- **Graceful fallback для отсутствующих perp'ов:** если конкретный символ не листится на OKX (например `IRYSUSDT` → OKX не имеет `IRYS-USDT-SWAP`), индикатор уходит в состояние `unavailable` без падения. Confluence считается только по BIN+BYB, остальное продолжает работать.
 
-Все 197 Python-тестов и 26 JS-тестов зелёные локально.
+Все 200 Python-тестов и 26 JS-тестов зелёные локально.
 
 ## Требования
 
@@ -68,6 +69,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 2. В строке статуса (внизу слева) должна появиться надпись `live_ready` (в пределах ~10–20 сек).
 3. Нажать **Start Heatmap** — справа налево пойдёт прокрутка тепловой карты.
 4. **Signal-lights** (под кнопкой) — три ряда (BUY / WAIT / SELL), в каждом ряду три половинки с подписями **BIN / BYB / OKX**. Никаких CB или KR быть не должно.
+   - Для популярных символов (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`) OKX-половинка зажигается через секунды.
+   - Для редких альтов, у которых на OKX нет перпа (напр. `IRYSUSDT`), OKX-половинка остаётся неактивной, а в детальной строке индикатора будет `OKX: unavailable BTC-USDT-SWAP (OKX does not list ... ; confluence uses Binance + Bybit only)`. Это **ожидаемое поведение**, не ошибка.
 5. Половинки начинают подсвечиваться по мере того, как каждая биржа доходит до `ready`. Если какая-то долго в `warming` — нормально, ассистент ждёт прогрева VPIN.
 6. В правой панели "Indicators" пойдут блоки от трёх бирж: `binance`, `bybit`, `okx`. **Никаких `coinbase` / `kraken`** в списке быть не должно.
 
@@ -80,8 +83,11 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 ### Проверка PR #3 (OKX вместо Coinbase/Kraken)
 
 - В консоли uvicorn не должно быть строк, начинающихся с `coinbase` / `kraken` (старт индикаторов).
-- Должна быть строка `okx indicator started` (или похожая) для активного символа.
-- В UI правая колонка "Indicators" показывает blocks для `okx` с теми же полями, что и для `binance` / `bybit` (state, vpin, conf и т.п.).
+- В DevTools → Network → WS видно событие `indicator_status` от `okx`:
+  - `state: "ready"` для популярных символов (`BTCUSDT`, `ETHUSDT`).
+  - `state: "unavailable"` для редких альтов, которых на OKX нет (`IRYSUSDT` и подобные).
+  - `state: "error"` — только если действительно проблема с подключением (firewall, сеть).
+- В UI правая колонка "Indicators" показывает blocks для `okx` с теми же полями, что и для `binance` / `bybit` (state, vpin, conf и т.п.) — но только когда OKX в `ready` и начал считать VPIN.
 
 ## 5. Остановить
 
@@ -92,10 +98,10 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 ```powershell
 .\.venv\Scripts\Activate.ps1
 pytest
-node --test tests\test_assistant_view.mjs tests\test_status_lights.mjs tests\test_multi_exchange_aggregation.mjs
+node --test tests\test_assistant_view.mjs tests\test_renderer_palette.mjs tests\test_signal_css.mjs
 ```
 
-Ожидаемо: 197 Python-тестов + 26 JS — все зелёные.
+Ожидаемо: **200 Python-тестов + 26 JS** — все зелёные.
 
 ## 7. Если что-то не так
 
@@ -114,8 +120,8 @@ node --test tests\test_assistant_view.mjs tests\test_status_lights.mjs tests\tes
 |---|---|
 | `app/ws_session.py` | Подключён `BinanceUserDataClient`, добавлен `_on_user_data_account_update`, REST-fallback каждые 10 с вместо 100 мс, watermark `_last_ws_position_update_ms` для защиты от race. OKX-индикатор стартует, Coinbase/Kraken — нет. |
 | `app/binance_user_data.py` | Новый клиент: listen key + 30-мин keepalive + WS на `wss://fstream.binance.com/ws/<key>` + reconnect с backoff. |
-| `app/okx_client.py` | Новый клиент OKX (v5 public WS, `books` + `trades`). |
-| `app/exchange_symbols.py` | Добавлена `to_okx_inst_id('BTCUSDT') -> 'BTC-USDT'`. |
+| `app/okx_client.py` | Новый клиент OKX (v5 public WS, `books` + `trades`). Отдельная exception `OkxUnsupportedInstrumentError` — для случая когда конкретный SWAP не листится; ловится в `_start_okx_indicator` и переводит OKX в `state: unavailable` вместо `state: error`. |
+| `app/exchange_symbols.py` | Добавлена `to_okx_inst_id('BTCUSDT') -> 'BTC-USDT-SWAP'` (перп OKX, не спот). |
 | `app/settings.py` | Константы `BINANCE_FAPI_USER_WS_URL`, `OKX_PUBLIC_WS_V5_URL`, `POSITION_REST_FALLBACK_INTERVAL_MS=10_000`, `LISTEN_KEY_KEEPALIVE_INTERVAL_MS=30*60_000`. |
 | `static/index.html`, `static/app.js`, `static/assistant_view.js` | Третий слот — `okx` вместо `coinbase`+`kraken`. Confluence `BUY x2` теперь "2 из 3". |
-| `tests/` | +3 теста на race-condition (`_refresh_position`), +8 тестов на `OkxMarketClient`, JS-тесты обновлены под `BUY x3`. |
+| `tests/` | +3 теста на race-condition (`_refresh_position`), +11 тестов на `OkxMarketClient` (включая 3 новых на unsupported-instrument), JS-тесты обновлены под `BUY x3`. |

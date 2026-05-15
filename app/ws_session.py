@@ -12,7 +12,7 @@ from app.binance_client import BinanceMarketClient
 from app.bybit_client import BybitMarketClient
 from app.coinbase_client import CoinbaseMarketClient
 from app.kraken_client import KrakenMarketClient
-from app.okx_client import OkxMarketClient
+from app.okx_client import OkxMarketClient, OkxUnsupportedInstrumentError
 from app.exchange_symbols import to_coinbase_product, to_kraken_pair, to_okx_inst_id
 from app.assistant_config import AssistantRiskSettings, load_default_risk_settings
 from app.assistant_config import load_binance_account_settings
@@ -1024,6 +1024,25 @@ class LiveHeatmapService:
         )
         try:
             await client.start(sync_timeout=60.0)
+        except OkxUnsupportedInstrumentError as exc:
+            with suppress(Exception):
+                await client.stop()
+            self.okx_client = None
+            self.okx_adaptive_market = None
+            self.okx_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "okx",
+                    "state": "unavailable",
+                    "product": inst_id,
+                    "message": (
+                        f"OKX does not list {inst_id}; confluence uses Binance + Bybit only"
+                    ),
+                    "detail": str(exc),
+                }
+            )
+            return
         except Exception as exc:
             with suppress(Exception):
                 await client.stop()

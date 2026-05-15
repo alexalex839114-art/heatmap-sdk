@@ -1,10 +1,16 @@
 """OKX v5 public WebSocket market client.
 
 Subscribes to ``books`` (400-depth snapshot + updates) and ``trades`` for a
-single instrument id (e.g. ``BTC-USDT``) and pipes the normalized events into
-an ``OrderBook`` and a ``TradeBuffer``, matching the interface used by
+single instrument id and pipes the normalized events into an ``OrderBook``
+and a ``TradeBuffer``, matching the interface used by
 ``BinanceMarketClient`` / ``BybitMarketClient`` / ``CoinbaseMarketClient`` /
 ``KrakenMarketClient``.
+
+In this app the OKX indicator mirrors a Binance USDⓈ-M perpetual futures
+symbol, so callers pass the OKX **perpetual swap** instId — e.g.
+``BTC-USDT-SWAP`` for the linear USDT-margined perpetual. The same v5 URL
+and ``books`` / ``trades`` channels also accept other instrument types
+(spot, futures, options) without code changes.
 
 Convention notes:
 
@@ -37,6 +43,39 @@ from websockets.exceptions import (
 from app.order_book import OrderBook
 from app.settings import OKX_PUBLIC_WS_V5_URL
 from app.trade_buffer import TradeBuffer
+
+
+class OkxUnsupportedInstrumentError(RuntimeError):
+    """Raised when OKX rejects the subscribe because the instId is not listed.
+
+    Distinct from generic ``RuntimeError`` so callers can surface this as
+    ``indicator_status=unavailable`` (a known-gap rather than a hard error
+    that should be retried). OKX returns this with ``event=error`` and a
+    message like ``"Wrong URL or channel:books,instId:FOO-USDT doesn't exist"``
+    (error code ``60018``).
+    """
+
+
+# OKX error codes that mean "instrument is not listed on this exchange".
+# We treat these as a soft-fail (indicator unavailable) rather than a crash.
+_OKX_UNSUPPORTED_INSTRUMENT_CODES = frozenset({"60018"})
+_OKX_UNSUPPORTED_INSTRUMENT_MARKERS = (
+    "doesn't exist",
+    "does not exist",
+)
+
+
+def _is_okx_unsupported_instrument(event: dict[str, Any]) -> bool:
+    code = event.get("code")
+    if code is not None and str(code) in _OKX_UNSUPPORTED_INSTRUMENT_CODES:
+        return True
+    msg = event.get("msg")
+    if isinstance(msg, str):
+        lowered = msg.lower()
+        for marker in _OKX_UNSUPPORTED_INSTRUMENT_MARKERS:
+            if marker in lowered:
+                return True
+    return False
 
 
 class OkxMarketClient:
@@ -134,6 +173,10 @@ class OkxMarketClient:
         event_kind = event.get("event")
         if event_kind == "error":
             msg = event.get("msg") or event.get("code") or event
+            if _is_okx_unsupported_instrument(event):
+                raise OkxUnsupportedInstrumentError(
+                    f"OKX instrument {self.inst_id} is not listed: {msg}"
+                )
             raise RuntimeError(f"OKX subscribe error: {msg}")
         if event_kind in {
             "subscribe",
