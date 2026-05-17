@@ -22,7 +22,7 @@ from app.exchange_symbols import (
 )
 from app.assistant_config import AssistantRiskSettings, load_default_risk_settings
 from app.assistant_config import load_binance_account_settings
-from app.adaptive_service import AdaptiveMarketService
+from app.adaptive_service import AdaptiveMarketService, gate_scalping_symbol_config
 from app.binance_account import BinanceAccountClient
 from app.binance_user_data import BinanceUserDataClient
 from app.entry_filter import AdaptiveVpinRegime, EntryFilterEngine
@@ -1145,7 +1145,14 @@ class LiveHeatmapService:
                 }
             )
             return
-        self.gate_adaptive_market = AdaptiveMarketService(contract)
+        # Use a Gate-specific config with min_ticks_for_z=100 instead of 200.
+        # Gate's per-exchange trade rate is ~3x lower than Binance/OKX, so the
+        # default 200-tick warmup leaves Gate stuck in WARMING for ~90s while
+        # peers go READY in ~30s. See gate_scalping_symbol_config() docstring.
+        self.gate_adaptive_market = AdaptiveMarketService(
+            contract,
+            config=gate_scalping_symbol_config(),
+        )
         self._apply_assistant_market_settings()
         await self.broadcast(
             {
