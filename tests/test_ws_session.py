@@ -4,7 +4,12 @@ import pytest
 from types import SimpleNamespace
 
 from adaptive_sdk.types import ExhaustionType, MetricsSnapshot, Signal
-from app.ws_session import BrowserSession, LiveHeatmapService
+from app.ws_session import (
+    BrowserSession,
+    LiveHeatmapService,
+    _confluence_entry_side,
+    _confluence_exit_reason,
+)
 from app.assistant_config import AssistantRiskSettings
 from app.adaptive_service import AdaptiveMarketService
 from app.position import PositionState
@@ -842,7 +847,7 @@ async def test_exit_uses_current_book_mark_for_max_loss():
 
 
 @pytest.mark.asyncio
-async def test_auto_trade_opens_long_on_binance_bybit_confluence():
+async def test_auto_trade_opens_long_on_three_of_four_confluence():
     service = LiveHeatmapService()
     service.session.mark_synced("BTCUSDT")
     service.session.assistant_settings = AssistantRiskSettings(
@@ -854,6 +859,8 @@ async def test_auto_trade_opens_long_on_binance_bybit_confluence():
     service.client = SimpleNamespace(quantity_step=0.001, min_quantity=0.001)
     service.book.bids = {64999.0: 1.0}
     service.book.asks = {65000.0: 1.0}
+    # 3-of-4 BUY confluence (gate still warming). User requirement: open
+    # market LONG when any 3 of 4 exchanges agree.
     service._last_entry_results = {
         "binance": {
             "market_state": "READY",
@@ -864,6 +871,16 @@ async def test_auto_trade_opens_long_on_binance_bybit_confluence():
             "market_state": "READY",
             "long_filter": "OK",
             "short_filter": "BLOCKED",
+        },
+        "okx": {
+            "market_state": "READY",
+            "long_filter": "OK",
+            "short_filter": "BLOCKED",
+        },
+        "gate": {
+            "market_state": "WARMING",
+            "long_filter": "WAIT",
+            "short_filter": "WAIT",
         },
     }
 
@@ -934,6 +951,16 @@ async def test_auto_trade_refreshes_position_before_opening():
             "market_state": "READY",
             "long_filter": "OK",
             "short_filter": "BLOCKED",
+        },
+        "okx": {
+            "market_state": "READY",
+            "long_filter": "OK",
+            "short_filter": "BLOCKED",
+        },
+        "gate": {
+            "market_state": "WARMING",
+            "long_filter": "WAIT",
+            "short_filter": "WAIT",
         },
     }
 
@@ -1018,16 +1045,24 @@ async def test_start_trading_waits_for_warm_entry_filters_before_arming():
     service._last_entry_results = {
         "binance": {"market_state": "WARMING", "long_filter": "WAIT", "short_filter": "WAIT"},
         "bybit": {"market_state": "READY", "long_filter": "WAIT", "short_filter": "WAIT"},
+        "okx": {"market_state": "WARMING", "long_filter": "WAIT", "short_filter": "WAIT"},
+        "gate": {"market_state": "WARMING", "long_filter": "WAIT", "short_filter": "WAIT"},
     }
 
     event = await service.start_trading(now_ms=1000)
 
+    # Only 1 of 4 warmed (bybit). Need >=3 warmed to arm.
     assert event["state"] == "WARMING"
     assert service.session.assistant_settings.auto_trade_enabled is True
 
     service._last_entry_results["binance"]["market_state"] = "READY"
     event = service._refresh_trading_readiness(now_ms=1100)
+    # 2 of 4 warmed: still WARMING.
+    assert event["state"] == "WARMING"
 
+    service._last_entry_results["okx"]["market_state"] = "READY"
+    event = service._refresh_trading_readiness(now_ms=1200)
+    # 3 of 4 warmed: ARM.
     assert event["state"] == "ARMED"
 
 
@@ -1046,13 +1081,30 @@ def test_trading_readiness_arms_when_filters_are_warmed_but_waiting():
             "short_filter": "WAIT",
             "reason": "adaptive_elevated_vpin",
         },
+        "okx": {
+            "market_state": "READY",
+            "long_filter": "WAIT",
+            "short_filter": "WAIT",
+            "reason": "no_signal",
+        },
+        "gate": {
+            "market_state": "WARMING",
+            "long_filter": "WAIT",
+            "short_filter": "WAIT",
+            "reason": "warming 5/10 buckets, 10/50 trades",
+        },
     }
 
     event = service._refresh_trading_readiness(now_ms=1000)
 
+    # 3 of 4 are out of WARMING (binance READY, bybit RISKY, okx READY)
+    # — confluence-readiness met. The risky / warming exchanges block
+    # the actual entry (no 3-of-4 same-side OK), but the trader is ARMED.
     assert event["state"] == "ARMED"
     assert "binance READY no_signal" in event["message"]
     assert "bybit RISKY adaptive_elevated_vpin" in event["message"]
+    assert "okx READY no_signal" in event["message"]
+    assert "gate WARMING" in event["message"]
 
 
 def test_trading_readiness_reports_warming_exchange_progress():
@@ -1070,10 +1122,23 @@ def test_trading_readiness_reports_warming_exchange_progress():
             "short_filter": "WAIT",
             "reason": "no_signal",
         },
+        "okx": {
+            "market_state": "WARMING",
+            "long_filter": "WAIT",
+            "short_filter": "WAIT",
+            "reason": "warming 0/10 buckets",
+        },
+        "gate": {
+            "market_state": "WARMING",
+            "long_filter": "WAIT",
+            "short_filter": "WAIT",
+            "reason": "warming 0/10 buckets",
+        },
     }
 
     event = service._refresh_trading_readiness(now_ms=1000)
 
+    # Only 1 of 4 warmed (bybit) -> still WARMING.
     assert event["state"] == "WARMING"
     assert "binance WARMING warming 3/10 buckets, 80/200 trades" in event["message"]
     assert "bybit READY no_signal" in event["message"]
@@ -1275,3 +1340,524 @@ async def test_on_gate_market_trade_increments_trade_count():
     )
 
     assert service.gate_adaptive_market.trade_count == 2
+
+
+# ---------------------------------------------------------------------------
+# 3-of-4 confluence entry / exit (user requirement: open at market when any
+# three of BIN/BYB/OKX/GATE agree, close when the same-side count drops below
+# three or any exchange flips to TOXIC/RISKY/opposite).
+# ---------------------------------------------------------------------------
+
+_BUY_RESULT = {"market_state": "READY", "long_filter": "OK", "short_filter": "BLOCKED"}
+_SELL_RESULT = {"market_state": "READY", "long_filter": "BLOCKED", "short_filter": "OK"}
+_WAIT_RESULT = {
+    "market_state": "READY",
+    "long_filter": "WAIT",
+    "short_filter": "WAIT",
+    "reason": "no_signal",
+}
+_WARMING_RESULT = {
+    "market_state": "WARMING",
+    "long_filter": "WAIT",
+    "short_filter": "WAIT",
+}
+_TOXIC_RESULT = {"market_state": "TOXIC", "reason": "toxic_vpin_watch_only"}
+_RISKY_RESULT = {
+    "market_state": "RISKY",
+    "long_filter": "WAIT",
+    "short_filter": "WAIT",
+    "reason": "adaptive_elevated_vpin",
+}
+
+
+def test_confluence_entry_side_long_with_three_of_four():
+    assert (
+        _confluence_entry_side(
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _BUY_RESULT,
+                "gate": _WARMING_RESULT,
+            }
+        )
+        == "LONG"
+    )
+
+
+def test_confluence_entry_side_long_with_all_four():
+    assert (
+        _confluence_entry_side(
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _BUY_RESULT,
+                "gate": _BUY_RESULT,
+            }
+        )
+        == "LONG"
+    )
+
+
+def test_confluence_entry_side_short_with_three_of_four():
+    assert (
+        _confluence_entry_side(
+            {
+                "binance": _SELL_RESULT,
+                "bybit": _SELL_RESULT,
+                "okx": _SELL_RESULT,
+                "gate": _WAIT_RESULT,
+            }
+        )
+        == "SHORT"
+    )
+
+
+def test_confluence_entry_side_two_of_four_does_not_enter():
+    assert (
+        _confluence_entry_side(
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _WAIT_RESULT,
+                "gate": _WAIT_RESULT,
+            }
+        )
+        is None
+    )
+
+
+def test_confluence_entry_side_opposite_signal_blocks_entry():
+    assert (
+        _confluence_entry_side(
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _BUY_RESULT,
+                "gate": _SELL_RESULT,
+            }
+        )
+        is None
+    )
+
+
+def test_confluence_entry_side_any_toxic_blocks_entry_even_with_three_buy():
+    assert (
+        _confluence_entry_side(
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _BUY_RESULT,
+                "gate": _TOXIC_RESULT,
+            }
+        )
+        is None
+    )
+
+
+def test_confluence_entry_side_any_risky_blocks_entry():
+    assert (
+        _confluence_entry_side(
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _BUY_RESULT,
+                "gate": _RISKY_RESULT,
+            }
+        )
+        is None
+    )
+
+
+def test_confluence_entry_side_empty_results_is_none():
+    assert _confluence_entry_side({}) is None
+
+
+def test_confluence_exit_reason_none_when_three_still_agree():
+    assert (
+        _confluence_exit_reason(
+            "LONG",
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _BUY_RESULT,
+                "gate": _WAIT_RESULT,
+            },
+        )
+        is None
+    )
+
+
+def test_confluence_exit_reason_fires_when_count_falls_below_three():
+    # Was 3-of-4 BUY, one exchange dropped to WAIT — confluence lost.
+    assert (
+        _confluence_exit_reason(
+            "LONG",
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _WAIT_RESULT,
+                "gate": _WAIT_RESULT,
+            },
+        )
+        == "confluence_exit_lost"
+    )
+
+
+def test_confluence_exit_reason_fires_on_opposite_signal():
+    # Even with 3 still BUY, one opposite SELL is an exit signal per user spec.
+    assert (
+        _confluence_exit_reason(
+            "LONG",
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _BUY_RESULT,
+                "gate": _SELL_RESULT,
+            },
+        )
+        == "confluence_exit_opposite_signal"
+    )
+
+
+def test_confluence_exit_reason_fires_on_any_toxic_exchange():
+    reason = _confluence_exit_reason(
+        "LONG",
+        {
+            "binance": _BUY_RESULT,
+            "bybit": _BUY_RESULT,
+            "okx": _BUY_RESULT,
+            "gate": _TOXIC_RESULT,
+        },
+    )
+    assert reason is not None
+    assert reason.startswith("confluence_exit_risk:")
+    assert "gate" in reason
+
+
+def test_confluence_exit_reason_fires_on_any_risky_exchange():
+    reason = _confluence_exit_reason(
+        "LONG",
+        {
+            "binance": _BUY_RESULT,
+            "bybit": _BUY_RESULT,
+            "okx": _RISKY_RESULT,
+            "gate": _BUY_RESULT,
+        },
+    )
+    assert reason is not None
+    assert reason.startswith("confluence_exit_risk:")
+    assert "okx" in reason
+
+
+def test_confluence_exit_reason_mirror_for_short():
+    # Same logic for SHORT side: opposite (long) signal triggers exit.
+    assert (
+        _confluence_exit_reason(
+            "SHORT",
+            {
+                "binance": _SELL_RESULT,
+                "bybit": _SELL_RESULT,
+                "okx": _SELL_RESULT,
+                "gate": _BUY_RESULT,
+            },
+        )
+        == "confluence_exit_opposite_signal"
+    )
+
+
+def test_confluence_exit_reason_none_for_unknown_side():
+    assert (
+        _confluence_exit_reason(
+            None,
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _BUY_RESULT,
+                "gate": _BUY_RESULT,
+            },
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluate_exit_closes_position_when_confluence_collapses():
+    """Open LONG; one exchange flips to TOXIC; market close fires immediately."""
+    from app.exit_engine import ExitEngine
+
+    service = LiveHeatmapService()
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=True,
+    )
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000,
+
+    )
+    service.exit_engine = ExitEngine()
+    service._last_entry_results = {
+        "binance": _BUY_RESULT,
+        "bybit": _BUY_RESULT,
+        "okx": _BUY_RESULT,
+        "gate": _TOXIC_RESULT,  # newly toxic — should trigger exit
+    }
+    events = []
+
+    async def capture(payload):
+        events.append(payload)
+
+    service.broadcast = capture
+
+    class FakeExecutor:
+        close_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def close_position(self, position):
+            self.calls.append(position)
+            return {"status": "NEW", "clientOrderId": "close-1"}
+
+    service.order_executor = FakeExecutor()
+
+    decision = await service._evaluate_exit(now_ms=1000)
+
+    assert decision.should_close is True
+    assert decision.hard_exit is True
+    assert decision.reason is not None
+    assert decision.reason.startswith("confluence_exit_risk:")
+    assert len(service.order_executor.calls) == 1
+    # First broadcast is the exit_status, second is the order_status.
+    assert events[0]["type"] == "exit_status"
+    assert events[0]["should_close"] is True
+    assert events[1]["type"] == "order_status"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_exit_does_not_fire_confluence_when_auto_trade_off():
+    """Confluence-exit is gated by auto_trade_enabled. Manual entries are
+    not auto-closed on signal degradation."""
+    from app.exit_engine import ExitEngine
+
+    service = LiveHeatmapService()
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=False,
+        auto_exit_enabled=False,
+    )
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000,
+
+    )
+    service.exit_engine = ExitEngine()
+    service._last_entry_results = {
+        "binance": _BUY_RESULT,
+        "bybit": _BUY_RESULT,
+        "okx": _BUY_RESULT,
+        "gate": _TOXIC_RESULT,
+    }
+
+    class FakeExecutor:
+        close_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def close_position(self, position):
+            self.calls.append(position)
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    async def capture(payload):
+        pass
+
+    service.broadcast = capture
+
+    decision = await service._evaluate_exit(now_ms=1000)
+
+    # Confluence reason ignored because auto_trade is off.
+    assert decision.reason is None or not decision.reason.startswith(
+        "confluence_exit"
+    )
+    assert service.order_executor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_evaluate_exit_closes_on_opposite_signal_under_auto_trade():
+    """User: 'смена сигнала на противоположный → закрытие по рынку'."""
+    from app.exit_engine import ExitEngine
+
+    service = LiveHeatmapService()
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=True,
+    )
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000,
+
+    )
+    service.exit_engine = ExitEngine()
+    service._last_entry_results = {
+        "binance": _BUY_RESULT,
+        "bybit": _BUY_RESULT,
+        "okx": _BUY_RESULT,
+        "gate": _SELL_RESULT,  # flipped opposite
+    }
+
+    class FakeExecutor:
+        close_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def close_position(self, position):
+            self.calls.append(position)
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    async def capture(payload):
+        pass
+
+    service.broadcast = capture
+
+    decision = await service._evaluate_exit(now_ms=1000)
+
+    assert decision.should_close is True
+    assert decision.reason == "confluence_exit_opposite_signal"
+    assert len(service.order_executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluate_exit_closes_when_signal_disappears():
+    """User: 'при пропадании сигнала → закрытие по рынку'."""
+    from app.exit_engine import ExitEngine
+
+    service = LiveHeatmapService()
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=True,
+    )
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000,
+
+    )
+    service.exit_engine = ExitEngine()
+    service._last_entry_results = {
+        "binance": _BUY_RESULT,
+        "bybit": _BUY_RESULT,
+        "okx": _WAIT_RESULT,  # signal disappeared
+        "gate": _WAIT_RESULT,
+    }
+
+    class FakeExecutor:
+        close_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def close_position(self, position):
+            self.calls.append(position)
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    async def capture(payload):
+        pass
+
+    service.broadcast = capture
+
+    decision = await service._evaluate_exit(now_ms=1000)
+
+    assert decision.should_close is True
+    assert decision.reason == "confluence_exit_lost"
+    assert len(service.order_executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_trade_does_not_open_on_two_of_four_confluence():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=True,
+    )
+    service.current_position = None
+    service.trading_state = "ARMED"
+    service.client = SimpleNamespace(quantity_step=0.001, min_quantity=0.001)
+    service.book.bids = {64999.0: 1.0}
+    service.book.asks = {65000.0: 1.0}
+    service._last_entry_results = {
+        "binance": _BUY_RESULT,
+        "bybit": _BUY_RESULT,
+        "okx": _WAIT_RESULT,
+        "gate": _WAIT_RESULT,
+    }
+
+    class FakeExecutor:
+        open_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def open_position(self, symbol, **kwargs):
+            self.calls.append((symbol, kwargs))
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    async def capture(payload):
+        pass
+
+    service.broadcast = capture
+
+    await service._evaluate_auto_trade(now_ms=1000)
+
+    # 2 of 4 BUY is below the 3-of-4 threshold; no order fired.
+    assert service.order_executor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_auto_trade_does_not_open_when_any_exchange_toxic():
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=True,
+    )
+    service.current_position = None
+    service.trading_state = "ARMED"
+    service.client = SimpleNamespace(quantity_step=0.001, min_quantity=0.001)
+    service.book.bids = {64999.0: 1.0}
+    service.book.asks = {65000.0: 1.0}
+    service._last_entry_results = {
+        "binance": _BUY_RESULT,
+        "bybit": _BUY_RESULT,
+        "okx": _BUY_RESULT,
+        "gate": _TOXIC_RESULT,
+    }
+
+    class FakeExecutor:
+        open_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def open_position(self, symbol, **kwargs):
+            self.calls.append((symbol, kwargs))
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    async def capture(payload):
+        pass
+
+    service.broadcast = capture
+
+    await service._evaluate_auto_trade(now_ms=1000)
+
+    # 3 BUY + 1 TOXIC: TOXIC blocks entry.
+    assert service.order_executor.calls == []

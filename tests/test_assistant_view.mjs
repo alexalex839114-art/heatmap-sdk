@@ -169,7 +169,7 @@ test("multiExchangeVisualState reports x3 when three of four exchanges agree", (
   });
 });
 
-test("multiExchangeVisualState falls back to x2 when only two exchanges agree", () => {
+test("multiExchangeVisualState stays WAIT when only two exchanges agree (sub-confluence)", () => {
   const states = {
     binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     bybit: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
@@ -177,9 +177,23 @@ test("multiExchangeVisualState falls back to x2 when only two exchanges agree", 
     gate: null,
   };
   assert.deepEqual(multiExchangeVisualState(states), {
-    mode: "buy",
-    label: "BUY x2",
-    reason: "Binance + Bybit",
+    mode: "wait",
+    label: "WAIT (2/3)",
+    reason: "Binance + Bybit BUY",
+  });
+});
+
+test("multiExchangeVisualState stays WAIT when only one exchange signals", () => {
+  const states = {
+    binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    bybit: { market_state: "READY", long_filter: "WAIT", short_filter: "WAIT", reason: "no_signal" },
+    okx: null,
+    gate: null,
+  };
+  assert.deepEqual(multiExchangeVisualState(states), {
+    mode: "wait",
+    label: "WAIT (1/3)",
+    reason: "Binance BUY",
   });
 });
 
@@ -194,6 +208,20 @@ test("multiExchangeVisualState reports MIXED when buy and sell coexist", () => {
     mode: "wait",
     label: "MIXED",
     reason: "Signals diverge",
+  });
+});
+
+test("multiExchangeVisualState reports RISK whenever any exchange is toxic, even with three BUY", () => {
+  const states = {
+    binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    bybit: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    okx: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    gate: { market_state: "TOXIC", reason: "toxic_vpin_watch_only" },
+  };
+  assert.deepEqual(multiExchangeVisualState(states), {
+    mode: "risk",
+    label: "RISK",
+    reason: "Gate",
   });
 });
 

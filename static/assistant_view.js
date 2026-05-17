@@ -78,6 +78,8 @@ const EXCHANGE_LABELS = {
   gate: "Gate",
 };
 
+export const CONFLUENCE_MIN_AGREE = 3;
+
 export function multiExchangeVisualState(exchangeStates) {
   const order = ["binance", "bybit", "okx", "gate"];
   const visuals = order.map((name) => ({
@@ -89,21 +91,10 @@ export function multiExchangeVisualState(exchangeStates) {
   const sell = visuals.filter((v) => v.visual.mode === "sell");
   const risk = visuals.filter((v) => v.visual.mode === "risk");
 
-  if (buy.length >= 2 && sell.length === 0) {
-    return {
-      mode: "buy",
-      label: `BUY x${buy.length}`,
-      reason: buy.map((v) => EXCHANGE_LABELS[v.name]).join(" + "),
-    };
-  }
-  if (sell.length >= 2 && buy.length === 0) {
-    return {
-      mode: "sell",
-      label: `SELL x${sell.length}`,
-      reason: sell.map((v) => EXCHANGE_LABELS[v.name]).join(" + "),
-    };
-  }
-  if (risk.length > 0 && buy.length === 0 && sell.length === 0) {
+  // RISK takes priority — any exchange showing TOXIC/RISKY blocks the
+  // confluence light from showing BUY/SELL, mirroring the backend's
+  // _confluence_entry_side ruleset.
+  if (risk.length > 0) {
     return {
       mode: "risk",
       label: "RISK",
@@ -113,18 +104,35 @@ export function multiExchangeVisualState(exchangeStates) {
   if (buy.length && sell.length) {
     return { mode: "wait", label: "MIXED", reason: "Signals diverge" };
   }
-  if (buy.length === 1) {
+  if (buy.length >= CONFLUENCE_MIN_AGREE) {
     return {
       mode: "buy",
-      label: "BUY",
-      reason: `${EXCHANGE_LABELS[buy[0].name]} only`,
+      label: `BUY x${buy.length}`,
+      reason: buy.map((v) => EXCHANGE_LABELS[v.name]).join(" + "),
     };
   }
-  if (sell.length === 1) {
+  if (sell.length >= CONFLUENCE_MIN_AGREE) {
     return {
       mode: "sell",
-      label: "SELL",
-      reason: `${EXCHANGE_LABELS[sell[0].name]} only`,
+      label: `SELL x${sell.length}`,
+      reason: sell.map((v) => EXCHANGE_LABELS[v.name]).join(" + "),
+    };
+  }
+  // Partial alignment (1-2 exchanges agree). Light stays grey/WAIT so the
+  // trader does not act on a sub-confluence signal, but the reason hints
+  // which way the partial pressure is.
+  if (buy.length > 0) {
+    return {
+      mode: "wait",
+      label: `WAIT (${buy.length}/${CONFLUENCE_MIN_AGREE})`,
+      reason: `${buy.map((v) => EXCHANGE_LABELS[v.name]).join(" + ")} BUY`,
+    };
+  }
+  if (sell.length > 0) {
+    return {
+      mode: "wait",
+      label: `WAIT (${sell.length}/${CONFLUENCE_MIN_AGREE})`,
+      reason: `${sell.map((v) => EXCHANGE_LABELS[v.name]).join(" + ")} SELL`,
     };
   }
   return { mode: "wait", label: "WAIT", reason: "No signal" };

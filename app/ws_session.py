@@ -736,12 +736,16 @@ class LiveHeatmapService:
         return self.cooldown_until_ms > now_ms
 
     def _entry_filters_warmed(self) -> bool:
-        binance = self._last_entry_results.get("binance")
-        bybit = self._last_entry_results.get("bybit")
-        return (
-            self._entry_result_warmed(binance)
-            and self._entry_result_warmed(bybit)
+        # 3-of-4 confluence: need at least 3 exchanges out of WARMING so the
+        # remaining one can be the "missing" vote. Anything stricter would
+        # leave the trader perpetually disarmed when one slow exchange (e.g.
+        # Gate's low trade rate) is still warming.
+        warmed = sum(
+            1
+            for exchange in CONFLUENCE_EXCHANGES
+            if self._entry_result_warmed(self._last_entry_results.get(exchange))
         )
+        return warmed >= CONFLUENCE_MIN_AGREE
 
     @staticmethod
     def _entry_result_warmed(result: Any) -> bool:
@@ -750,7 +754,7 @@ class LiveHeatmapService:
 
     def _entry_readiness_message(self) -> str:
         parts = []
-        for exchange in ("binance", "bybit"):
+        for exchange in CONFLUENCE_EXCHANGES:
             result = self._last_entry_results.get(exchange)
             state = _entry_value(result, "market_state") or "NO_DATA"
             reason = _entry_value(result, "reason") or "-"
@@ -1461,12 +1465,25 @@ class LiveHeatmapService:
         if self.exit_engine is None or self.current_position is None:
             return None
         marked_position = self._mark_position_to_book(self.current_position)
+        settings = self.session.assistant_settings
+        # Confluence-driven exit: the open position must keep a 3-of-4 same-side
+        # confluence with zero opposite / toxic / risky exchanges. When this
+        # breaks, ExitEngine returns a hard EXIT_ARMED with should_close=True.
+        # Gated on auto_trade_enabled so manual entries are not affected.
+        confluence_reason = (
+            _confluence_exit_reason(
+                self.current_position.side, self._last_entry_results
+            )
+            if settings.auto_trade_enabled
+            else None
+        )
         decision = self.exit_engine.evaluate(
             position=marked_position,
             sdk_state=self.adaptive_market.state() if self.adaptive_market is not None else None,
             latest_signal=self._latest_active_signal(now_ms),
-            settings=self.session.assistant_settings,
+            settings=settings,
             now_ms=now_ms,
+            confluence_exit_reason=confluence_reason,
         )
         if decision.reason is not None:
             await self.broadcast(
@@ -1734,19 +1751,113 @@ def _entry_value(result: Any, key: str) -> Any:
     return getattr(result, key, None)
 
 
+CONFLUENCE_EXCHANGES: tuple[str, ...] = ("binance", "bybit", "okx", "gate")
+CONFLUENCE_MIN_AGREE = 3
+CONFLUENCE_RISK_STATES = frozenset({"TOXIC", "RISKY"})
+
+
+def _exchange_signal_mode(result: Any) -> str:
+    """Classify a per-exchange entry_filter result into a single mode.
+
+    Mirrors the UI's ``signalVisualState`` so backend trade decisions track
+    the same traffic-light state the user sees. Modes:
+
+    * ``"risk"`` -- market_state is TOXIC or RISKY (toxic VPIN, elevated
+      regime, etc.). Blocks entry and triggers exit.
+    * ``"buy"``  -- long_filter == OK and short_filter != OK.
+    * ``"sell"`` -- short_filter == OK and long_filter != OK.
+    * ``"wait"`` -- everything else (warming, no_signal, both filters OK,
+      both blocked, missing payload, ...).
+
+    Returning ``"wait"`` instead of treating warming/missing as risk lets a
+    still-warming Gate indicator coexist with three READY peers without
+    blocking the 3-of-4 confluence.
+    """
+    if result is None:
+        return "wait"
+    market_state = _entry_value(result, "market_state")
+    if market_state in CONFLUENCE_RISK_STATES:
+        return "risk"
+    long_ok = _entry_value(result, "long_filter") == "OK"
+    short_ok = _entry_value(result, "short_filter") == "OK"
+    if long_ok and not short_ok:
+        return "buy"
+    if short_ok and not long_ok:
+        return "sell"
+    return "wait"
+
+
 def _confluence_entry_side(results: dict[str, Any]) -> str | None:
-    binance = results.get("binance")
-    bybit = results.get("bybit")
-    if binance is None or bybit is None:
+    """Return the entry side when at least ``CONFLUENCE_MIN_AGREE`` of the
+    four exchanges agree on the same direction with no opposite signal and
+    no TOXIC/RISKY exchange.
+
+    The full ruleset:
+
+    * Need 3-of-4 exchanges with the same directional mode (``buy`` or
+      ``sell``). The 4th exchange may be ``wait`` (e.g. still warming).
+    * Zero exchanges may show the opposite direction.
+    * Zero exchanges may be ``risk`` (TOXIC/RISKY). Any single risky
+      exchange blocks entry even if three others agree.
+
+    The exit policy is the mirror image, see ``_confluence_exit_reason``.
+    """
+    long_count = 0
+    short_count = 0
+    risk_count = 0
+    for exchange in CONFLUENCE_EXCHANGES:
+        mode = _exchange_signal_mode(results.get(exchange))
+        if mode == "risk":
+            risk_count += 1
+        elif mode == "buy":
+            long_count += 1
+        elif mode == "sell":
+            short_count += 1
+    if risk_count > 0:
         return None
-    if (
-        _entry_value(binance, "long_filter") == "OK"
-        and _entry_value(bybit, "long_filter") == "OK"
-    ):
+    if long_count >= CONFLUENCE_MIN_AGREE and short_count == 0:
         return "LONG"
-    if (
-        _entry_value(binance, "short_filter") == "OK"
-        and _entry_value(bybit, "short_filter") == "OK"
-    ):
+    if short_count >= CONFLUENCE_MIN_AGREE and long_count == 0:
         return "SHORT"
+    return None
+
+
+def _confluence_exit_reason(
+    side: str | None, results: dict[str, Any]
+) -> str | None:
+    """Return an exit reason when the open position is no longer backed by a
+    3-of-4 same-side confluence, or any exchange has degraded to toxic /
+    risky / opposite. Mirrors ``_confluence_entry_side``.
+
+    Returned reason strings:
+
+    * ``"confluence_exit_risk:<exchanges>"`` -- one or more exchanges are
+      TOXIC or RISKY (e.g. toxic VPIN, elevated regime).
+    * ``"confluence_exit_opposite_signal"``  -- at least one exchange now
+      shows the opposite directional filter.
+    * ``"confluence_exit_lost"``             -- same-side count fell below
+      the 3-of-4 threshold (signal "disappeared" on at least one of the
+      exchanges that originally agreed).
+    """
+    if side not in {"LONG", "SHORT"}:
+        return None
+    same_side_target = "buy" if side == "LONG" else "sell"
+    opposite_target = "sell" if side == "LONG" else "buy"
+    same_side_count = 0
+    opposite_count = 0
+    risk_exchanges: list[str] = []
+    for exchange in CONFLUENCE_EXCHANGES:
+        mode = _exchange_signal_mode(results.get(exchange))
+        if mode == "risk":
+            risk_exchanges.append(exchange)
+        elif mode == same_side_target:
+            same_side_count += 1
+        elif mode == opposite_target:
+            opposite_count += 1
+    if risk_exchanges:
+        return f"confluence_exit_risk:{'+'.join(risk_exchanges)}"
+    if opposite_count > 0:
+        return "confluence_exit_opposite_signal"
+    if same_side_count < CONFLUENCE_MIN_AGREE:
+        return "confluence_exit_lost"
     return None
