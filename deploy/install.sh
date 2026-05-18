@@ -21,6 +21,14 @@ echo "[install] project root: ${PROJECT_ROOT}"
 
 # --- 1. System packages -------------------------------------------------------
 
+# Use sudo when not running as root; many VPS images run as root with no sudo
+# installed at all, so this avoids a hard dependency on sudo.
+if [[ ${EUID} -eq 0 ]]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
 NEEDED_APT_PACKAGES=(python3 python3-venv python3-pip curl ca-certificates)
 MISSING_PACKAGES=()
 for pkg in "${NEEDED_APT_PACKAGES[@]}"; do
@@ -31,8 +39,8 @@ done
 
 if [[ ${#MISSING_PACKAGES[@]} -gt 0 ]]; then
     echo "[install] installing missing apt packages: ${MISSING_PACKAGES[*]}"
-    sudo apt-get update
-    sudo apt-get install -y "${MISSING_PACKAGES[@]}"
+    ${SUDO} apt-get update
+    ${SUDO} apt-get install -y "${MISSING_PACKAGES[@]}"
 else
     echo "[install] all required apt packages are already present"
 fi
