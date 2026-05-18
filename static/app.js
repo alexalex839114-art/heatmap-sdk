@@ -10,6 +10,7 @@ import {
 const symbolInput = document.getElementById("symbol");
 const compressionInput = document.getElementById("compression");
 const connectButton = document.getElementById("connect-btn");
+const stopWsButton = document.getElementById("stop-ws-btn");
 const toggleButton = document.getElementById("toggle-btn");
 const statusNode = document.getElementById("status");
 const displayStepNode = document.getElementById("display-step");
@@ -50,14 +51,14 @@ let tradingActive = false;
 const exchangeSignals = {
   binance: null,
   bybit: null,
-  coinbase: null,
-  kraken: null,
+  okx: null,
+  gate: null,
 };
 const exchangeStatus = {
   binance: null,
   bybit: null,
-  coinbase: null,
-  kraken: null,
+  okx: null,
+  gate: null,
 };
 
 function setStatus(text) {
@@ -101,16 +102,21 @@ function setSignalVisual(payload) {
   signalDetailNode.textContent = [
     formatDetailLine("binance", "BIN"),
     formatDetailLine("bybit", "BYB"),
-    formatDetailLine("coinbase", "CB "),
-    formatDetailLine("kraken", "KR "),
+    formatDetailLine("okx", "OKX"),
+    formatDetailLine("gate", "GATE"),
   ].join("\n");
 
-  for (const name of ["binance", "bybit", "coinbase", "kraken"]) {
+  for (const name of ["binance", "bybit", "okx", "gate"]) {
     updateExchangeHalf(name, signalVisualState(exchangeSignals[name]));
   }
 }
 
 function updateExchangeHalf(exchange, visual) {
+  const arrow = visual.mode === "risk" && visual.toxicDirection === "BUY"
+    ? "\u2191"
+    : visual.mode === "risk" && visual.toxicDirection === "SELL"
+      ? "\u2193"
+      : "";
   for (const row of ["buy", "wait", "sell"]) {
     const rowNode = document.querySelector(`[data-signal-row="${row}"]`);
     const halfNode = rowNode?.querySelector(`[data-exchange-half="${exchange}"]`);
@@ -125,6 +131,14 @@ function updateExchangeHalf(exchange, visual) {
     halfNode.classList.toggle("active", isActive);
     halfNode.classList.toggle("risk", visual.mode === "risk" && row === "wait");
     halfNode.classList.toggle("off", visual.mode === "off");
+    // Show the toxic-flow direction arrow only on the lit RISK cell (in the
+    // WAIT row, which is where TOXIC/RISKY renders). Other rows clear it so
+    // the arrow doesn't bleed across rows when state flips.
+    if (row === "wait" && arrow) {
+      halfNode.dataset.arrow = arrow;
+    } else {
+      delete halfNode.dataset.arrow;
+    }
   }
   buyLightNode.classList.toggle("active", Boolean(buyLightNode.querySelector(".active")));
   waitLightNode.classList.toggle("active", Boolean(waitLightNode.querySelector(".active")));
@@ -145,6 +159,9 @@ function ensureSocket() {
       toggleButton.disabled = !["live_ready", "streaming", "stopped"].includes(payload.state);
       tradingToggleButton.disabled = !["live_ready", "streaming", "stopped"].includes(payload.state);
       emergencyFlattenButton.disabled = !["live_ready", "streaming", "stopped"].includes(payload.state);
+      // Stop WS button is enabled any time the user has initiated a connect;
+      // includes 'connecting' so a still-handshaking session can be aborted.
+      stopWsButton.disabled = !["connecting", "live_ready", "streaming", "stopped"].includes(payload.state);
       if (payload.state === "streaming") {
         streaming = true;
         toggleButton.textContent = "Stop Heatmap";
@@ -237,6 +254,7 @@ function ensureSocket() {
     toggleButton.disabled = true;
     tradingToggleButton.disabled = true;
     emergencyFlattenButton.disabled = true;
+    stopWsButton.disabled = true;
     streaming = false;
     tradingActive = false;
     toggleButton.textContent = "Start Heatmap";
@@ -308,6 +326,34 @@ connectButton.addEventListener("click", () => {
   } else {
     ws.addEventListener("open", sendConnect, { once: true });
   }
+});
+
+stopWsButton.addEventListener("click", () => {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  socket.send(JSON.stringify({ type: "disconnect" }));
+  // Optimistic local reset so lights / heatmap go cold immediately. The
+  // authoritative 'status' broadcast that follows keeps us in sync.
+  setStatus("disconnecting");
+  stopWsButton.disabled = true;
+  toggleButton.disabled = true;
+  tradingToggleButton.disabled = true;
+  emergencyFlattenButton.disabled = true;
+  streaming = false;
+  tradingActive = false;
+  toggleButton.textContent = "Start Heatmap";
+  tradingToggleButton.textContent = "START Trading";
+  setDisplayStep(null, null);
+  renderer.reset();
+  for (const name of Object.keys(exchangeSignals)) {
+    exchangeSignals[name] = null;
+    exchangeStatus[name] = null;
+    setSignalVisual({ exchange: name });
+  }
+  entryFilterNode.textContent = "entry: -";
+  positionStateNode.textContent = "position: flat";
+  exitStateNode.textContent = "exit: -";
 });
 
 toggleButton.addEventListener("click", () => {

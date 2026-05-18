@@ -12,10 +12,17 @@ from app.binance_client import BinanceMarketClient
 from app.bybit_client import BybitMarketClient
 from app.coinbase_client import CoinbaseMarketClient
 from app.kraken_client import KrakenMarketClient
-from app.exchange_symbols import to_coinbase_product, to_kraken_pair
+from app.okx_client import OkxMarketClient, OkxUnsupportedInstrumentError
+from app.gate_client import GateMarketClient, GateUnsupportedContractError
+from app.exchange_symbols import (
+    to_coinbase_product,
+    to_kraken_pair,
+    to_okx_inst_id,
+    to_gate_contract,
+)
 from app.assistant_config import AssistantRiskSettings, load_default_risk_settings
 from app.assistant_config import load_binance_account_settings
-from app.adaptive_service import AdaptiveMarketService
+from app.adaptive_service import AdaptiveMarketService, gate_scalping_symbol_config
 from app.binance_account import BinanceAccountClient
 from app.binance_user_data import BinanceUserDataClient
 from app.entry_filter import AdaptiveVpinRegime, EntryFilterEngine
@@ -260,8 +267,25 @@ class LiveHeatmapService:
             block_on_toxic_vpin=False,
             vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
         )
+        self.okx_book = OrderBook()
+        self.okx_trade_buffer = TradeBuffer()
+        self.okx_client: OkxMarketClient | None = None
+        self.okx_adaptive_market: AdaptiveMarketService | None = None
+        self.okx_entry_filter: EntryFilterEngine | None = EntryFilterEngine(
+            block_on_toxic_vpin=False,
+            vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
+        )
+        self.gate_book = OrderBook()
+        self.gate_trade_buffer = TradeBuffer()
+        self.gate_client: GateMarketClient | None = None
+        self.gate_adaptive_market: AdaptiveMarketService | None = None
+        self.gate_entry_filter: EntryFilterEngine | None = EntryFilterEngine(
+            block_on_toxic_vpin=False,
+            vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
+        )
         self._coinbase_start_task: asyncio.Task | None = None
         self._kraken_start_task: asyncio.Task | None = None
+        self._okx_start_task: asyncio.Task | None = None
         self.exit_engine: ExitEngine | None = ExitEngine()
         self.account_client: BinanceAccountClient | None = None
         self.order_executor: OrderExecutor | None = None
@@ -335,13 +359,22 @@ class LiveHeatmapService:
             self.coinbase_trade_buffer = TradeBuffer()
             self.kraken_book = OrderBook()
             self.kraken_trade_buffer = TradeBuffer()
+            self.okx_book = OrderBook()
+            self.okx_trade_buffer = TradeBuffer()
+            self.gate_book = OrderBook()
+            self.gate_trade_buffer = TradeBuffer()
             self._last_entry_results = {}
             self._last_auto_trade_ms = 0
             self.frame_builder = None
             self.adaptive_market = AdaptiveMarketService(symbol)
             self.bybit_adaptive_market = AdaptiveMarketService(symbol)
+            # Coinbase and Kraken indicators are intentionally disabled —
+            # OKX takes their place. Their clients/code are kept in the tree
+            # so they can be re-enabled later without re-implementation.
             self.coinbase_adaptive_market = None
             self.kraken_adaptive_market = None
+            self.okx_adaptive_market = None
+            self.gate_adaptive_market = None
             self._apply_assistant_market_settings()
             self.entry_filter = EntryFilterEngine(
                 block_on_toxic_vpin=False,
@@ -351,11 +384,13 @@ class LiveHeatmapService:
                 block_on_toxic_vpin=False,
                 vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
             )
-            self.coinbase_entry_filter = EntryFilterEngine(
+            self.coinbase_entry_filter = None
+            self.kraken_entry_filter = None
+            self.okx_entry_filter = EntryFilterEngine(
                 block_on_toxic_vpin=False,
                 vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
             )
-            self.kraken_entry_filter = EntryFilterEngine(
+            self.gate_entry_filter = EntryFilterEngine(
                 block_on_toxic_vpin=False,
                 vpin_regime=AdaptiveVpinRegime(window_ms=60_000),
             )
@@ -394,13 +429,17 @@ class LiveHeatmapService:
                 return
 
             await self._stop_indicator_start_tasks()
-            self._coinbase_start_task = asyncio.create_task(
-                self._start_coinbase_indicator(symbol),
-                name="coinbase-indicator-start",
+            # Coinbase/Kraken indicators are disabled by request; the third
+            # and fourth slots are OKX (perpetual SWAP) and Gate (USDT-margined
+            # perpetual). The Coinbase/Kraken start methods are still present
+            # in this module but no longer invoked.
+            self._okx_start_task = asyncio.create_task(
+                self._start_okx_indicator(symbol),
+                name="okx-indicator-start",
             )
-            self._kraken_start_task = asyncio.create_task(
-                self._start_kraken_indicator(symbol),
-                name="kraken-indicator-start",
+            self._gate_start_task = asyncio.create_task(
+                self._start_gate_indicator(symbol),
+                name="gate-indicator-start",
             )
 
             self.frame_builder = FrameBuilder(
@@ -445,7 +484,12 @@ class LiveHeatmapService:
         self._position_poll_task = None
 
     async def _stop_indicator_start_tasks(self) -> None:
-        for attr in ("_coinbase_start_task", "_kraken_start_task"):
+        for attr in (
+            "_coinbase_start_task",
+            "_kraken_start_task",
+            "_okx_start_task",
+            "_gate_start_task",
+        ):
             task: asyncio.Task | None = getattr(self, attr, None)
             if task is None:
                 continue
@@ -510,6 +554,18 @@ class LiveHeatmapService:
             self.kraken_client = None
             self.kraken_adaptive_market = None
             self.kraken_entry_filter = None
+            if self.okx_client is not None:
+                with suppress(Exception):
+                    await self.okx_client.stop()
+            self.okx_client = None
+            self.okx_adaptive_market = None
+            self.okx_entry_filter = None
+            if self.gate_client is not None:
+                with suppress(Exception):
+                    await self.gate_client.stop()
+            self.gate_client = None
+            self.gate_adaptive_market = None
+            self.gate_entry_filter = None
             self.exit_engine = None
             self.account_client = None
             self.order_executor = None
@@ -680,12 +736,16 @@ class LiveHeatmapService:
         return self.cooldown_until_ms > now_ms
 
     def _entry_filters_warmed(self) -> bool:
-        binance = self._last_entry_results.get("binance")
-        bybit = self._last_entry_results.get("bybit")
-        return (
-            self._entry_result_warmed(binance)
-            and self._entry_result_warmed(bybit)
+        # 3-of-4 confluence: need at least 3 exchanges out of WARMING so the
+        # remaining one can be the "missing" vote. Anything stricter would
+        # leave the trader perpetually disarmed when one slow exchange (e.g.
+        # Gate's low trade rate) is still warming.
+        warmed = sum(
+            1
+            for exchange in CONFLUENCE_EXCHANGES
+            if self._entry_result_warmed(self._last_entry_results.get(exchange))
         )
+        return warmed >= CONFLUENCE_MIN_AGREE
 
     @staticmethod
     def _entry_result_warmed(result: Any) -> bool:
@@ -694,7 +754,7 @@ class LiveHeatmapService:
 
     def _entry_readiness_message(self) -> str:
         parts = []
-        for exchange in ("binance", "bybit"):
+        for exchange in CONFLUENCE_EXCHANGES:
             result = self._last_entry_results.get(exchange)
             state = _entry_value(result, "market_state") or "NO_DATA"
             reason = _entry_value(result, "reason") or "-"
@@ -827,6 +887,54 @@ class LiveHeatmapService:
         )
         self._schedule_assistant_snapshot()
 
+    def _on_okx_market_trade(self, trade: dict[str, Any]) -> None:
+        if self.okx_adaptive_market is None:
+            return
+        self.okx_adaptive_market.on_agg_trade(trade)
+        self._schedule_assistant_snapshot()
+
+    def _on_gate_market_trade(self, trade: dict[str, Any]) -> None:
+        if self.gate_adaptive_market is None:
+            return
+        self.gate_adaptive_market.on_agg_trade(trade)
+        self._schedule_assistant_snapshot()
+
+    def _on_gate_book_update(self, book: OrderBook, event_time_ms: int | None) -> None:
+        if self.gate_adaptive_market is None:
+            return
+        best_bid = book.best_bid()
+        best_ask = book.best_ask()
+        if best_bid is None or best_ask is None:
+            return
+        bid_vol = book.bids.get(best_bid, 0.0)
+        ask_vol = book.asks.get(best_ask, 0.0)
+        self.gate_adaptive_market.on_top_of_book(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            bid_vol=bid_vol,
+            ask_vol=ask_vol,
+            timestamp_ms=event_time_ms,
+        )
+        self._schedule_assistant_snapshot()
+
+    def _on_okx_book_update(self, book: OrderBook, event_time_ms: int | None) -> None:
+        if self.okx_adaptive_market is None:
+            return
+        best_bid = book.best_bid()
+        best_ask = book.best_ask()
+        if best_bid is None or best_ask is None:
+            return
+        bid_vol = book.bids.get(best_bid, 0.0)
+        ask_vol = book.asks.get(best_ask, 0.0)
+        self.okx_adaptive_market.on_top_of_book(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            bid_vol=bid_vol,
+            ask_vol=ask_vol,
+            timestamp_ms=event_time_ms,
+        )
+        self._schedule_assistant_snapshot()
+
     async def _start_coinbase_indicator(self, symbol: str) -> None:
         product_id = to_coinbase_product(symbol)
         if product_id is None:
@@ -947,6 +1055,171 @@ class LiveHeatmapService:
             }
         )
 
+    async def _start_okx_indicator(self, symbol: str) -> None:
+        inst_id = to_okx_inst_id(symbol)
+        if inst_id is None:
+            self.okx_client = None
+            self.okx_adaptive_market = None
+            self.okx_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "okx",
+                    "state": "unavailable",
+                    "message": f"no OKX instrument for {symbol}",
+                }
+            )
+            return
+        self.okx_adaptive_market = AdaptiveMarketService(inst_id)
+        self._apply_assistant_market_settings()
+        await self.broadcast(
+            {
+                "type": "indicator_status",
+                "exchange": "okx",
+                "state": "connecting",
+                "product": inst_id,
+            }
+        )
+        client = OkxMarketClient(
+            inst_id=inst_id,
+            order_book=self.okx_book,
+            trade_buffer=self.okx_trade_buffer,
+            on_trade=self._on_okx_market_trade,
+            on_book_update=self._on_okx_book_update,
+        )
+        try:
+            await client.start(sync_timeout=60.0)
+        except OkxUnsupportedInstrumentError as exc:
+            with suppress(Exception):
+                await client.stop()
+            self.okx_client = None
+            self.okx_adaptive_market = None
+            self.okx_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "okx",
+                    "state": "unavailable",
+                    "product": inst_id,
+                    "message": (
+                        f"OKX does not list {inst_id}; confluence uses Binance + Bybit only"
+                    ),
+                    "detail": str(exc),
+                }
+            )
+            return
+        except Exception as exc:
+            with suppress(Exception):
+                await client.stop()
+            self.okx_client = None
+            self.okx_adaptive_market = None
+            self.okx_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "okx",
+                    "state": "error",
+                    "product": inst_id,
+                    "message": str(exc) or type(exc).__name__,
+                }
+            )
+            return
+        self.okx_client = client
+        await self.broadcast(
+            {
+                "type": "indicator_status",
+                "exchange": "okx",
+                "state": "ready",
+                "product": inst_id,
+            }
+        )
+
+    async def _start_gate_indicator(self, symbol: str) -> None:
+        contract = to_gate_contract(symbol)
+        if contract is None:
+            self.gate_client = None
+            self.gate_adaptive_market = None
+            self.gate_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "gate",
+                    "state": "unavailable",
+                    "message": f"no Gate contract for {symbol}",
+                }
+            )
+            return
+        # Use a Gate-specific config with min_ticks_for_z=100 instead of 200.
+        # Gate's per-exchange trade rate is ~3x lower than Binance/OKX, so the
+        # default 200-tick warmup leaves Gate stuck in WARMING for ~90s while
+        # peers go READY in ~30s. See gate_scalping_symbol_config() docstring.
+        self.gate_adaptive_market = AdaptiveMarketService(
+            contract,
+            config=gate_scalping_symbol_config(),
+        )
+        self._apply_assistant_market_settings()
+        await self.broadcast(
+            {
+                "type": "indicator_status",
+                "exchange": "gate",
+                "state": "connecting",
+                "product": contract,
+            }
+        )
+        client = GateMarketClient(
+            contract=contract,
+            order_book=self.gate_book,
+            trade_buffer=self.gate_trade_buffer,
+            on_trade=self._on_gate_market_trade,
+            on_book_update=self._on_gate_book_update,
+        )
+        try:
+            await client.start(sync_timeout=60.0)
+        except GateUnsupportedContractError as exc:
+            with suppress(Exception):
+                await client.stop()
+            self.gate_client = None
+            self.gate_adaptive_market = None
+            self.gate_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "gate",
+                    "state": "unavailable",
+                    "product": contract,
+                    "message": (
+                        f"Gate does not list {contract}; confluence proceeds without Gate"
+                    ),
+                    "detail": str(exc),
+                }
+            )
+            return
+        except Exception as exc:
+            with suppress(Exception):
+                await client.stop()
+            self.gate_client = None
+            self.gate_adaptive_market = None
+            self.gate_entry_filter = None
+            await self.broadcast(
+                {
+                    "type": "indicator_status",
+                    "exchange": "gate",
+                    "state": "error",
+                    "product": contract,
+                    "message": str(exc) or type(exc).__name__,
+                }
+            )
+            return
+        self.gate_client = client
+        await self.broadcast(
+            {
+                "type": "indicator_status",
+                "exchange": "gate",
+                "state": "ready",
+                "product": contract,
+            }
+        )
+
     def _schedule_assistant_snapshot(self) -> None:
         now_ms = int(time.time() * 1000)
         if now_ms - self._last_assistant_broadcast_ms < 500:
@@ -961,6 +1234,8 @@ class LiveHeatmapService:
             self.bybit_adaptive_market,
             self.coinbase_adaptive_market,
             self.kraken_adaptive_market,
+            self.okx_adaptive_market,
+            self.gate_adaptive_market,
         ):
             if market is None:
                 continue
@@ -1190,12 +1465,25 @@ class LiveHeatmapService:
         if self.exit_engine is None or self.current_position is None:
             return None
         marked_position = self._mark_position_to_book(self.current_position)
+        settings = self.session.assistant_settings
+        # Confluence-driven exit: the open position must keep a 3-of-4 same-side
+        # confluence with zero opposite / toxic / risky exchanges. When this
+        # breaks, ExitEngine returns a hard EXIT_ARMED with should_close=True.
+        # Gated on auto_trade_enabled so manual entries are not affected.
+        confluence_reason = (
+            _confluence_exit_reason(
+                self.current_position.side, self._last_entry_results
+            )
+            if settings.auto_trade_enabled
+            else None
+        )
         decision = self.exit_engine.evaluate(
             position=marked_position,
             sdk_state=self.adaptive_market.state() if self.adaptive_market is not None else None,
             latest_signal=self._latest_active_signal(now_ms),
-            settings=self.session.assistant_settings,
+            settings=settings,
             now_ms=now_ms,
+            confluence_exit_reason=confluence_reason,
         )
         if decision.reason is not None:
             await self.broadcast(
@@ -1336,6 +1624,8 @@ class LiveHeatmapService:
                     "latest_signal_type": result.latest_signal_type,
                     "latest_signal_confidence": result.latest_signal_confidence,
                     "vpin": result.vpin,
+                    "signed_vpin": result.signed_vpin,
+                    "toxic_direction": _toxic_direction(result),
                     "exchange": "binance",
                 }
             )
@@ -1361,18 +1651,23 @@ class LiveHeatmapService:
                     "latest_signal_type": result.latest_signal_type,
                     "latest_signal_confidence": result.latest_signal_confidence,
                     "vpin": result.vpin,
+                    "signed_vpin": result.signed_vpin,
+                    "toxic_direction": _toxic_direction(result),
                 }
             )
+        # Coinbase + Kraken indicator broadcasts are intentionally suppressed
+        # — OKX has replaced them in the UI. The helper still exists and the
+        # client code is preserved in case either is re-enabled in the future.
         await self._broadcast_indicator_entry_filter(
-            "coinbase",
-            self.coinbase_adaptive_market,
-            self.coinbase_entry_filter,
+            "okx",
+            self.okx_adaptive_market,
+            self.okx_entry_filter,
             now_ms=now_ms,
         )
         await self._broadcast_indicator_entry_filter(
-            "kraken",
-            self.kraken_adaptive_market,
-            self.kraken_entry_filter,
+            "gate",
+            self.gate_adaptive_market,
+            self.gate_entry_filter,
             now_ms=now_ms,
         )
         if self.trading_state in TRADING_ACTIVE_STATES:
@@ -1428,6 +1723,8 @@ class LiveHeatmapService:
                 "latest_signal_type": result.latest_signal_type,
                 "latest_signal_confidence": result.latest_signal_confidence,
                 "vpin": result.vpin,
+                "signed_vpin": result.signed_vpin,
+                "toxic_direction": _toxic_direction(result),
             }
         )
 
@@ -1451,7 +1748,40 @@ def _entry_result_payload(result: Any) -> dict[str, Any]:
         "latest_signal_type": result.latest_signal_type,
         "latest_signal_confidence": result.latest_signal_confidence,
         "vpin": result.vpin,
+        "signed_vpin": getattr(result, "signed_vpin", 0.0),
+        "toxic_direction": _toxic_direction(result),
     }
+
+
+# Net imbalance below this absolute value is treated as "no clear direction".
+# Matches the UI threshold so the same indicator is shown on both sides.
+TOXIC_DIRECTION_MIN_SIGNED_VPIN = 0.05
+
+
+def _toxic_direction(result: Any) -> str | None:
+    """Return ``"BUY"`` / ``"SELL"`` for TOXIC / RISKY results, else ``None``.
+
+    Direction is derived from ``signed_vpin`` (range ``[-1, +1]``). A small
+    dead-zone (``TOXIC_DIRECTION_MIN_SIGNED_VPIN``) suppresses the arrow when
+    the net imbalance is too close to zero to call a side -- the regime can
+    be toxic by volatility alone with roughly balanced buy/sell flow.
+
+    Outside TOXIC / RISKY (i.e. NORMAL, READY, WARMING) this returns ``None``
+    so the UI keeps its existing rendering for non-risk states. The raw
+    ``signed_vpin`` value is still broadcast separately for diagnostics.
+    """
+    market_state = _entry_value(result, "market_state")
+    if market_state not in CONFLUENCE_RISK_STATES:
+        return None
+    try:
+        signed = float(_entry_value(result, "signed_vpin") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if signed >= TOXIC_DIRECTION_MIN_SIGNED_VPIN:
+        return "BUY"
+    if signed <= -TOXIC_DIRECTION_MIN_SIGNED_VPIN:
+        return "SELL"
+    return None
 
 
 def _entry_value(result: Any, key: str) -> Any:
@@ -1460,19 +1790,115 @@ def _entry_value(result: Any, key: str) -> Any:
     return getattr(result, key, None)
 
 
+CONFLUENCE_EXCHANGES: tuple[str, ...] = ("binance", "bybit", "okx", "gate")
+CONFLUENCE_MIN_AGREE = 3
+CONFLUENCE_RISK_STATES = frozenset({"TOXIC", "RISKY"})
+
+
+def _exchange_signal_mode(result: Any) -> str:
+    """Classify a per-exchange entry_filter result into a single mode.
+
+    Mirrors the UI's ``signalVisualState`` so backend trade decisions track
+    the same traffic-light state the user sees. Modes:
+
+    * ``"risk"`` -- market_state is TOXIC or RISKY (toxic VPIN, elevated
+      regime, etc.). The UI still renders this with a red RISK light + a
+      ``toxic_direction`` arrow, but trading-wise it is treated the same as
+      ``"wait"`` -- it neither contributes to nor blocks the 3-of-4
+      confluence. See ``_confluence_entry_side`` / ``_confluence_exit_reason``.
+    * ``"buy"``  -- long_filter == OK and short_filter != OK.
+    * ``"sell"`` -- short_filter == OK and long_filter != OK.
+    * ``"wait"`` -- everything else (warming, no_signal, both filters OK,
+      both blocked, missing payload, ...).
+
+    Returning ``"wait"`` instead of treating warming/missing as risk lets a
+    still-warming Gate indicator coexist with three READY peers without
+    blocking the 3-of-4 confluence.
+    """
+    if result is None:
+        return "wait"
+    market_state = _entry_value(result, "market_state")
+    if market_state in CONFLUENCE_RISK_STATES:
+        return "risk"
+    long_ok = _entry_value(result, "long_filter") == "OK"
+    short_ok = _entry_value(result, "short_filter") == "OK"
+    if long_ok and not short_ok:
+        return "buy"
+    if short_ok and not long_ok:
+        return "sell"
+    return "wait"
+
+
 def _confluence_entry_side(results: dict[str, Any]) -> str | None:
-    binance = results.get("binance")
-    bybit = results.get("bybit")
-    if binance is None or bybit is None:
-        return None
-    if (
-        _entry_value(binance, "long_filter") == "OK"
-        and _entry_value(bybit, "long_filter") == "OK"
-    ):
+    """Return the entry side when at least ``CONFLUENCE_MIN_AGREE`` of the
+    four exchanges agree on the same direction with no opposite signal.
+
+    The full ruleset:
+
+    * Need 3-of-4 exchanges with the same directional mode (``buy`` or
+      ``sell``). The remaining exchange(s) may be ``wait`` (still warming)
+    *  or ``risk`` (TOXIC / RISKY) -- both are treated as neutral and
+      neither contribute to nor block the entry.
+    * Zero exchanges may show the opposite direction.
+
+    TOXIC / RISKY on a single venue used to block entry, but the user
+    explicitly opted into a more permissive regime: a noisy / toxic single
+    feed should not veto a 3-of-4 same-side consensus. The exit policy is
+    the mirror image (see ``_confluence_exit_reason``) so we don't enter
+    and immediately get kicked out by the same TOXIC reading.
+    """
+    long_count = 0
+    short_count = 0
+    for exchange in CONFLUENCE_EXCHANGES:
+        mode = _exchange_signal_mode(results.get(exchange))
+        if mode == "buy":
+            long_count += 1
+        elif mode == "sell":
+            short_count += 1
+        # "risk" and "wait" are both neutral -- ignored for direction count.
+    if long_count >= CONFLUENCE_MIN_AGREE and short_count == 0:
         return "LONG"
-    if (
-        _entry_value(binance, "short_filter") == "OK"
-        and _entry_value(bybit, "short_filter") == "OK"
-    ):
+    if short_count >= CONFLUENCE_MIN_AGREE and long_count == 0:
         return "SHORT"
+    return None
+
+
+def _confluence_exit_reason(
+    side: str | None, results: dict[str, Any]
+) -> str | None:
+    """Return an exit reason when the open position is no longer backed by a
+    3-of-4 same-side confluence, or any exchange flips to the opposite
+    direction. Mirrors ``_confluence_entry_side``.
+
+    Returned reason strings:
+
+    * ``"confluence_exit_opposite_signal"`` -- at least one exchange now
+      shows the opposite directional filter.
+    * ``"confluence_exit_lost"``            -- same-side count fell below
+      the 3-of-4 threshold (signal "disappeared" on at least one of the
+      exchanges that originally agreed). A venue that switches from BUY
+      to TOXIC / RISKY also counts here, because it stops contributing to
+      the same-side count -- but a single TOXIC venue alongside three
+      still-BUY venues does NOT trigger an exit on its own. This matches
+      the more permissive entry rule.
+    """
+    if side not in {"LONG", "SHORT"}:
+        return None
+    same_side_target = "buy" if side == "LONG" else "sell"
+    opposite_target = "sell" if side == "LONG" else "buy"
+    same_side_count = 0
+    opposite_count = 0
+    for exchange in CONFLUENCE_EXCHANGES:
+        mode = _exchange_signal_mode(results.get(exchange))
+        if mode == same_side_target:
+            same_side_count += 1
+        elif mode == opposite_target:
+            opposite_count += 1
+        # "risk" and "wait" are both neutral -- they reduce the same-side
+        # count (and may trigger 'confluence_exit_lost') but do not by
+        # themselves close the position the way the old rule did.
+    if opposite_count > 0:
+        return "confluence_exit_opposite_signal"
+    if same_side_count < CONFLUENCE_MIN_AGREE:
+        return "confluence_exit_lost"
     return None

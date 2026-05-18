@@ -1,8 +1,50 @@
+// Minimum absolute |signed_vpin| at which we call a side. Matches the
+// backend threshold (TOXIC_DIRECTION_MIN_SIGNED_VPIN) so UI and server
+// agree on what counts as "directional" toxic flow.
+export const TOXIC_DIRECTION_THRESHOLD = 0.05;
+
+export function deriveToxicDirection(payload) {
+  if (!payload) {
+    return null;
+  }
+  if (payload.toxic_direction === "BUY" || payload.toxic_direction === "SELL") {
+    return payload.toxic_direction;
+  }
+  const signed = Number(payload.signed_vpin);
+  if (!Number.isFinite(signed)) {
+    return null;
+  }
+  if (signed >= TOXIC_DIRECTION_THRESHOLD) {
+    return "BUY";
+  }
+  if (signed <= -TOXIC_DIRECTION_THRESHOLD) {
+    return "SELL";
+  }
+  return null;
+}
+
+function directionArrow(direction) {
+  if (direction === "BUY") return "\u2191";
+  if (direction === "SELL") return "\u2193";
+  return "";
+}
+
 export function formatEntryFilter(payload) {
   if (!payload) {
     return "entry: -";
   }
-  return `${payload.market_state} | L:${payload.long_filter} S:${payload.short_filter} | ${payload.reason}`;
+  const isRisk = payload.market_state === "TOXIC" || payload.market_state === "RISKY";
+  let suffix = "";
+  if (isRisk) {
+    const direction = deriveToxicDirection(payload);
+    const arrow = directionArrow(direction);
+    if (arrow) {
+      suffix = ` | flow ${arrow}${direction}`;
+    } else if (Number.isFinite(Number(payload.signed_vpin))) {
+      suffix = ` | flow ~0`;
+    }
+  }
+  return `${payload.market_state} | L:${payload.long_filter} S:${payload.short_filter} | ${payload.reason}${suffix}`;
 }
 
 export function formatPosition(payload) {
@@ -31,18 +73,30 @@ export function formatTradingStatus(payload) {
 
 export function signalVisualState(payload) {
   if (!payload) {
-    return { mode: "off", label: "WAIT", reason: "No data" };
+    return { mode: "off", label: "WAIT", reason: "No data", toxicDirection: null };
   }
   if (payload.market_state === "TOXIC" || payload.market_state === "RISKY") {
-    return { mode: "risk", label: "RISK", reason: payload.reason || payload.market_state };
+    const direction = deriveToxicDirection(payload);
+    const arrow = directionArrow(direction);
+    const label = arrow ? `RISK ${arrow}` : "RISK";
+    const reason = direction
+      ? `${payload.reason || payload.market_state} (toxic ${direction})`
+      : (payload.reason || payload.market_state);
+    return {
+      mode: "risk",
+      label,
+      reason,
+      toxicDirection: direction,
+      signedVpin: Number.isFinite(Number(payload.signed_vpin)) ? Number(payload.signed_vpin) : null,
+    };
   }
   if (payload.long_filter === "OK" && payload.short_filter !== "OK") {
-    return { mode: "buy", label: "BUY", reason: "Long conditions" };
+    return { mode: "buy", label: "BUY", reason: "Long conditions", toxicDirection: null };
   }
   if (payload.short_filter === "OK" && payload.long_filter !== "OK") {
-    return { mode: "sell", label: "SELL", reason: "Short conditions" };
+    return { mode: "sell", label: "SELL", reason: "Short conditions", toxicDirection: null };
   }
-  return { mode: "wait", label: "WAIT", reason: payload.reason || "No signal" };
+  return { mode: "wait", label: "WAIT", reason: payload.reason || "No signal", toxicDirection: null };
 }
 
 export function confluenceVisualState(exchangeStates) {
@@ -74,12 +128,14 @@ export function confluenceVisualState(exchangeStates) {
 const EXCHANGE_LABELS = {
   binance: "Binance",
   bybit: "Bybit",
-  coinbase: "Coinbase",
-  kraken: "Kraken",
+  okx: "OKX",
+  gate: "Gate",
 };
 
+export const CONFLUENCE_MIN_AGREE = 3;
+
 export function multiExchangeVisualState(exchangeStates) {
-  const order = ["binance", "bybit", "coinbase", "kraken"];
+  const order = ["binance", "bybit", "okx", "gate"];
   const visuals = order.map((name) => ({
     name,
     visual: signalVisualState(exchangeStates?.[name]),
@@ -89,42 +145,82 @@ export function multiExchangeVisualState(exchangeStates) {
   const sell = visuals.filter((v) => v.visual.mode === "sell");
   const risk = visuals.filter((v) => v.visual.mode === "risk");
 
-  if (buy.length >= 2 && sell.length === 0) {
-    return {
-      mode: "buy",
-      label: `BUY x${buy.length}`,
-      reason: buy.map((v) => EXCHANGE_LABELS[v.name]).join(" + "),
-    };
-  }
-  if (sell.length >= 2 && buy.length === 0) {
-    return {
-      mode: "sell",
-      label: `SELL x${sell.length}`,
-      reason: sell.map((v) => EXCHANGE_LABELS[v.name]).join(" + "),
-    };
-  }
-  if (risk.length > 0 && buy.length === 0 && sell.length === 0) {
-    return {
-      mode: "risk",
-      label: "RISK",
-      reason: risk.map((v) => EXCHANGE_LABELS[v.name]).join(" / "),
-    };
-  }
+  // Mixed directional signals always block. This stays first because the
+  // user does not want to enter when venues disagree on direction.
   if (buy.length && sell.length) {
     return { mode: "wait", label: "MIXED", reason: "Signals diverge" };
   }
-  if (buy.length === 1) {
+
+  // 3-of-4 same-side consensus takes priority over a single RISK venue.
+  // Mirrors the backend _confluence_entry_side rule: TOXIC / RISKY on a
+  // minority of venues is treated as neutral (like WAIT) and does not
+  // veto a same-side consensus on the other three. When such a venue
+  // does exist we still hint at it in `reason` so the trader knows.
+  if (buy.length >= CONFLUENCE_MIN_AGREE) {
+    const reasonParts = [buy.map((v) => EXCHANGE_LABELS[v.name]).join(" + ")];
+    if (risk.length > 0) {
+      reasonParts.push(
+        `risk: ${risk.map((v) => EXCHANGE_LABELS[v.name]).join(" / ")}`,
+      );
+    }
     return {
       mode: "buy",
-      label: "BUY",
-      reason: `${EXCHANGE_LABELS[buy[0].name]} only`,
+      label: `BUY x${buy.length}`,
+      reason: reasonParts.join(" • "),
     };
   }
-  if (sell.length === 1) {
+  if (sell.length >= CONFLUENCE_MIN_AGREE) {
+    const reasonParts = [sell.map((v) => EXCHANGE_LABELS[v.name]).join(" + ")];
+    if (risk.length > 0) {
+      reasonParts.push(
+        `risk: ${risk.map((v) => EXCHANGE_LABELS[v.name]).join(" / ")}`,
+      );
+    }
     return {
       mode: "sell",
-      label: "SELL",
-      reason: `${EXCHANGE_LABELS[sell[0].name]} only`,
+      label: `SELL x${sell.length}`,
+      reason: reasonParts.join(" • "),
+    };
+  }
+
+  // No 3-of-same consensus. If at least one venue is risky, surface that
+  // so the trader can see flow toxicity even without a tradeable signal.
+  if (risk.length > 0) {
+    const buyDir = risk.filter((v) => v.visual.toxicDirection === "BUY").length;
+    const sellDir = risk.filter((v) => v.visual.toxicDirection === "SELL").length;
+    let summaryDirection = null;
+    if (buyDir > sellDir) summaryDirection = "BUY";
+    else if (sellDir > buyDir) summaryDirection = "SELL";
+    const arrow = directionArrow(summaryDirection);
+    const exchangeList = risk
+      .map((v) => {
+        const exArrow = directionArrow(v.visual.toxicDirection);
+        return exArrow ? `${EXCHANGE_LABELS[v.name]}${exArrow}` : EXCHANGE_LABELS[v.name];
+      })
+      .join(" / ");
+    return {
+      mode: "risk",
+      label: arrow ? `RISK ${arrow}` : "RISK",
+      reason: exchangeList,
+      toxicDirection: summaryDirection,
+    };
+  }
+
+  // Partial alignment (1-2 exchanges agree). Light stays grey/WAIT so the
+  // trader does not act on a sub-confluence signal, but the reason hints
+  // which way the partial pressure is.
+  if (buy.length > 0) {
+    return {
+      mode: "wait",
+      label: `WAIT (${buy.length}/${CONFLUENCE_MIN_AGREE})`,
+      reason: `${buy.map((v) => EXCHANGE_LABELS[v.name]).join(" + ")} BUY`,
+    };
+  }
+  if (sell.length > 0) {
+    return {
+      mode: "wait",
+      label: `WAIT (${sell.length}/${CONFLUENCE_MIN_AGREE})`,
+      reason: `${sell.map((v) => EXCHANGE_LABELS[v.name]).join(" + ")} SELL`,
     };
   }
   return { mode: "wait", label: "WAIT", reason: "No signal" };

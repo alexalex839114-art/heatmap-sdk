@@ -31,10 +31,25 @@ class ExitEngine:
         latest_signal: Signal | None,
         settings: AssistantRiskSettings,
         now_ms: int,
+        confluence_exit_reason: str | None = None,
     ) -> ExitDecision:
         if not position.is_open:
             self._clear_soft()
             return ExitDecision(state="NO_POSITION", should_close=False)
+
+        # Confluence-driven exit takes priority over the legacy per-Binance
+        # hard-exit rules. When the multi-exchange traffic light no longer
+        # backs the open position, close immediately at market regardless of
+        # auto_exit_enabled — the caller already gated this by
+        # auto_trade_enabled, mirroring the entry toggle the user controls.
+        if confluence_exit_reason is not None:
+            self._clear_soft()
+            return ExitDecision(
+                state="EXIT_ARMED",
+                should_close=True,
+                reason=confluence_exit_reason,
+                hard_exit=True,
+            )
 
         hard_reason = self._hard_exit_reason(position, sdk_state, latest_signal, settings)
         if hard_reason is not None:

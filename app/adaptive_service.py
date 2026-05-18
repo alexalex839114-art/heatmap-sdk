@@ -150,3 +150,21 @@ def live_scalping_symbol_config() -> SymbolConfig:
         vpin_high=1.01,
         z_thresholds=(1.5, 2.0, 2.5),
     )
+
+
+def gate_scalping_symbol_config() -> SymbolConfig:
+    """Live UI preset tuned for Gate.io USDT-margined perpetual futures.
+
+    Gate's per-exchange trade rate is significantly lower than Binance / OKX
+    (measured ~1-2 trades/s vs ~5-7 trades/s on BTC), so the canonical 200-
+    tick z-score warmup would leave the Gate indicator stuck in WARMING for
+    1-2+ minutes while the other three lights have already gone READY
+    (Binance/OKX reach ready in ~30s on BTC). 50 ticks is the smallest
+    sample that still produces a usable z-score (variance estimate has
+    ~10% relative error at n=50), and brings Gate's warmup time roughly
+    in line with its peers. VPIN bucket count and everything else stays
+    identical to the Binance preset so signal semantics are consistent
+    across exchanges.
+    """
+    from dataclasses import replace
+    return replace(live_scalping_symbol_config(), min_ticks_for_z=50)

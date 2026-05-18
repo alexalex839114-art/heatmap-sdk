@@ -320,6 +320,7 @@ class AdaptiveAnalyticsSDK:
             pending_signals_count=pending_count,
             buckets_filled=ctx.vpin_engine.buckets_filled,
             realized_vol=ctx.exhaustion.realized_vol,
+            signed_vpin=ctx.vpin_engine.signed_vpin,
         )
 
     def report_outcome(self, symbol: str, outcome: Outcome) -> bool:

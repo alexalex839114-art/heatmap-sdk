@@ -179,6 +179,33 @@ class TrueVPINEngine:
         return total_abs / (len(self._closed) * self._bucket_size)
 
     @property
+    def signed_vpin(self) -> float:
+        """Directional (signed) VPIN over the same window.
+
+        Unlike :pyattr:`vpin` (which uses ``|v_buy - v_sell|``), this returns
+        the net signed imbalance::
+
+            signed_vpin = mean( v_buy - v_sell ) / V_bucket   in [-1, +1]
+
+        * ``+1`` means every bucket in the window was pure BUY flow.
+        * ``-1`` means every bucket was pure SELL flow.
+        * Near ``0`` means flow is balanced.
+
+        Easley/Lopez de Prado-O'Hara use the absolute imbalance (adverse-
+        selection / market-maker view). The signed counterpart is exposed
+        separately so downstream consumers can identify *which side* the
+        toxic flow is on (informed buyers vs informed sellers). It is
+        independent of the toxicity gate -- it can be inspected at any
+        time, including in NORMAL market states.
+        """
+        if not self._closed or self._bucket_size <= 0.0:
+            return 0.0
+        total_signed = 0.0
+        for b in self._closed:
+            total_signed += b.v_buy - b.v_sell
+        return total_signed / (len(self._closed) * self._bucket_size)
+
+    @property
     def buckets_filled(self) -> int:
         """Number of classified buckets currently in the VPIN window."""
         return len(self._closed)
