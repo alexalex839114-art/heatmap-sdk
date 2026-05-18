@@ -111,6 +111,11 @@ function setSignalVisual(payload) {
 }
 
 function updateExchangeHalf(exchange, visual) {
+  const arrow = visual.mode === "risk" && visual.toxicDirection === "BUY"
+    ? "\u2191"
+    : visual.mode === "risk" && visual.toxicDirection === "SELL"
+      ? "\u2193"
+      : "";
   for (const row of ["buy", "wait", "sell"]) {
     const rowNode = document.querySelector(`[data-signal-row="${row}"]`);
     const halfNode = rowNode?.querySelector(`[data-exchange-half="${exchange}"]`);
@@ -125,6 +130,14 @@ function updateExchangeHalf(exchange, visual) {
     halfNode.classList.toggle("active", isActive);
     halfNode.classList.toggle("risk", visual.mode === "risk" && row === "wait");
     halfNode.classList.toggle("off", visual.mode === "off");
+    // Show the toxic-flow direction arrow only on the lit RISK cell (in the
+    // WAIT row, which is where TOXIC/RISKY renders). Other rows clear it so
+    // the arrow doesn't bleed across rows when state flips.
+    if (row === "wait" && arrow) {
+      halfNode.dataset.arrow = arrow;
+    } else {
+      delete halfNode.dataset.arrow;
+    }
   }
   buyLightNode.classList.toggle("active", Boolean(buyLightNode.querySelector(".active")));
   waitLightNode.classList.toggle("active", Boolean(waitLightNode.querySelector(".active")));

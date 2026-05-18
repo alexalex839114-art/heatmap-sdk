@@ -17,6 +17,10 @@ class EntryFilterResult:
     latest_signal_type: str | None = None
     latest_signal_confidence: float | None = None
     vpin: float = 0.0
+    # Signed VPIN in [-1, +1] (positive => net BUY flow, negative => net SELL
+    # flow). Surfaced for diagnostics so the UI can show *which side* a TOXIC
+    # / RISKY regime is on. Does not affect filter decisions in v1.
+    signed_vpin: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -78,6 +82,27 @@ class AdaptiveVpinRegime:
             self._samples.popleft()
 
 
+def _clamp_signed_vpin(value: Any) -> float:
+    """Coerce ``value`` to a float and clamp to ``[-1.0, +1.0]``.
+
+    Math guarantees ``signed_vpin`` stays in ``[-1, +1]``, but rounding error
+    on the volume-bucket boundary can produce e.g. ``1.0000000003``. Clamp at
+    the API boundary so downstream consumers (UI, logs, tests) can safely
+    rely on the documented range.
+    """
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if x != x:  # NaN guard
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    if x < -1.0:
+        return -1.0
+    return x
+
+
 def _quantile(values: list[float], q: float) -> float:
     if not values:
         return 0.0
@@ -115,6 +140,7 @@ class EntryFilterEngine:
         now_ms: int | None = None,
     ) -> EntryFilterResult:
         vpin = float(getattr(sdk_state, "vpin", 0.0))
+        signed_vpin = _clamp_signed_vpin(getattr(sdk_state, "signed_vpin", 0.0))
         if not bool(getattr(sdk_state, "is_ready", False)):
             buckets = int(getattr(sdk_state, "buckets_filled", 0))
             trades = int(trade_count or 0)
@@ -127,6 +153,7 @@ class EntryFilterEngine:
                     f"{trades}/{min_ticks_for_z} trades"
                 ),
                 vpin=vpin,
+                signed_vpin=signed_vpin,
             )
 
         if self.vpin_regime is not None:
@@ -142,6 +169,7 @@ class EntryFilterEngine:
                         short_filter="WAIT",
                         reason="adaptive_toxic_vpin_watch_only",
                         vpin=vpin,
+                        signed_vpin=signed_vpin,
                     )
                 return EntryFilterResult(
                     market_state="TOXIC",
@@ -149,6 +177,7 @@ class EntryFilterEngine:
                     short_filter="BLOCKED",
                     reason="adaptive_toxic_vpin",
                     vpin=vpin,
+                    signed_vpin=signed_vpin,
                 )
             if regime.market_state == "RISKY":
                 return EntryFilterResult(
@@ -157,6 +186,7 @@ class EntryFilterEngine:
                     short_filter="WAIT",
                     reason="adaptive_elevated_vpin",
                     vpin=vpin,
+                    signed_vpin=signed_vpin,
                 )
 
         if vpin >= self.vpin_high:
@@ -167,6 +197,7 @@ class EntryFilterEngine:
                     short_filter="WAIT",
                     reason="toxic_vpin_watch_only",
                     vpin=vpin,
+                    signed_vpin=signed_vpin,
                 )
             return EntryFilterResult(
                 market_state="TOXIC",
@@ -174,6 +205,7 @@ class EntryFilterEngine:
                 short_filter="BLOCKED",
                 reason="toxic_vpin",
                 vpin=vpin,
+                signed_vpin=signed_vpin,
             )
 
         if vpin >= self.vpin_warn:
@@ -183,6 +215,7 @@ class EntryFilterEngine:
                 short_filter="WAIT",
                 reason="elevated_vpin",
                 vpin=vpin,
+                signed_vpin=signed_vpin,
             )
 
         if latest_signal is None:
@@ -192,6 +225,7 @@ class EntryFilterEngine:
                 short_filter="WAIT",
                 reason="no_signal",
                 vpin=vpin,
+                signed_vpin=signed_vpin,
             )
 
         signal_type = latest_signal.exhaustion_type.name
@@ -204,6 +238,7 @@ class EntryFilterEngine:
                 latest_signal_type=signal_type,
                 latest_signal_confidence=latest_signal.confidence,
                 vpin=vpin,
+                signed_vpin=signed_vpin,
             )
 
         if latest_signal.exhaustion_type is ExhaustionType.SELL_EXHAUSTION:
@@ -215,6 +250,7 @@ class EntryFilterEngine:
                 latest_signal_type=signal_type,
                 latest_signal_confidence=latest_signal.confidence,
                 vpin=vpin,
+                signed_vpin=signed_vpin,
             )
 
         return EntryFilterResult(
@@ -225,4 +261,5 @@ class EntryFilterEngine:
             latest_signal_type=signal_type,
             latest_signal_confidence=latest_signal.confidence,
             vpin=vpin,
+            signed_vpin=signed_vpin,
         )

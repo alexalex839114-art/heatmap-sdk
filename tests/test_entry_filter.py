@@ -12,6 +12,7 @@ class DummyState:
     buy_exhaustion_z: float = 0.0
     pending_signals_count: int = 0
     buckets_filled: int = 0
+    signed_vpin: float = 0.0
 
 
 def _signal(exhaustion_type: ExhaustionType, confidence: float = 0.8) -> Signal:
@@ -151,3 +152,45 @@ def test_ready_without_signal_waits():
     assert result.long_filter == "WAIT"
     assert result.short_filter == "WAIT"
     assert result.reason == "no_signal"
+
+
+def test_entry_filter_propagates_signed_vpin_when_toxic():
+    """TOXIC result still carries the directional signed VPIN downstream."""
+    result = EntryFilterEngine(vpin_high=0.92).evaluate(
+        DummyState(True, 0.95, signed_vpin=0.42), None
+    )
+
+    assert result.market_state == "TOXIC"
+    assert result.signed_vpin == 0.42
+
+
+def test_entry_filter_propagates_signed_vpin_when_risky():
+    """RISKY (mid-toxicity) result also carries direction."""
+    result = EntryFilterEngine(vpin_high=0.92, vpin_warn=0.70).evaluate(
+        DummyState(True, 0.80, signed_vpin=-0.31),
+        None,
+    )
+
+    assert result.market_state == "RISKY"
+    assert result.signed_vpin == -0.31
+
+
+def test_entry_filter_clamps_signed_vpin_to_unit_range():
+    """SDK can transiently emit |signed_vpin| slightly above 1.0 due to FP
+    rounding on bucket boundaries. The filter must clamp at the API edge."""
+    above = EntryFilterEngine().evaluate(DummyState(True, 0.2, signed_vpin=1.5), None)
+    below = EntryFilterEngine().evaluate(DummyState(True, 0.2, signed_vpin=-2.3), None)
+
+    assert above.signed_vpin == 1.0
+    assert below.signed_vpin == -1.0
+
+
+def test_entry_filter_signed_vpin_during_warming():
+    result = EntryFilterEngine().evaluate(
+        DummyState(False, 0.0, buckets_filled=5, signed_vpin=0.2),
+        None,
+        trade_count=10,
+    )
+
+    assert result.market_state == "WARMING"
+    assert result.signed_vpin == 0.2

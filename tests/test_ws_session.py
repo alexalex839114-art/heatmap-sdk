@@ -7,8 +7,11 @@ from adaptive_sdk.types import ExhaustionType, MetricsSnapshot, Signal
 from app.ws_session import (
     BrowserSession,
     LiveHeatmapService,
+    TOXIC_DIRECTION_MIN_SIGNED_VPIN,
     _confluence_entry_side,
     _confluence_exit_reason,
+    _entry_result_payload,
+    _toxic_direction,
 )
 from app.assistant_config import AssistantRiskSettings
 from app.adaptive_service import AdaptiveMarketService
@@ -1861,3 +1864,86 @@ async def test_auto_trade_does_not_open_when_any_exchange_toxic():
 
     # 3 BUY + 1 TOXIC: TOXIC blocks entry.
     assert service.order_executor.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Signed VPIN / toxic flow direction surfacing (data-only; trading logic is
+# unchanged by signed VPIN -- it is exposed for diagnostics so the UI can
+# render an arrow showing which side a TOXIC / RISKY regime is on).
+# ---------------------------------------------------------------------------
+
+
+def test_toxic_direction_is_none_outside_risk_states():
+    """READY / WARMING / NORMAL never report a toxic_direction, regardless of
+    signed_vpin magnitude -- the arrow only makes sense within RISK regimes."""
+    for state in ("READY", "WARMING", "NORMAL"):
+        result = {
+            "market_state": state,
+            "signed_vpin": 0.9,  # strongly directional but not toxic
+        }
+        assert _toxic_direction(result) is None
+
+
+def test_toxic_direction_returns_buy_when_signed_vpin_positive_in_toxic():
+    result = {"market_state": "TOXIC", "signed_vpin": 0.42}
+    assert _toxic_direction(result) == "BUY"
+
+
+def test_toxic_direction_returns_sell_when_signed_vpin_negative_in_risky():
+    result = {"market_state": "RISKY", "signed_vpin": -0.18}
+    assert _toxic_direction(result) == "SELL"
+
+
+def test_toxic_direction_dead_zone_around_zero():
+    """When |signed_vpin| is below the threshold, no direction is reported
+    even in TOXIC. Volatility-driven toxicity with balanced flow is possible."""
+    threshold = TOXIC_DIRECTION_MIN_SIGNED_VPIN
+    just_below = {"market_state": "TOXIC", "signed_vpin": threshold - 0.001}
+    just_above = {"market_state": "TOXIC", "signed_vpin": threshold + 0.001}
+    assert _toxic_direction(just_below) is None
+    assert _toxic_direction(just_above) == "BUY"
+    assert _toxic_direction({"market_state": "TOXIC", "signed_vpin": 0.0}) is None
+
+
+def test_toxic_direction_handles_missing_signed_vpin_field():
+    """Older payloads without signed_vpin must not blow up the helper."""
+    result = {"market_state": "TOXIC", "reason": "toxic_vpin"}
+    assert _toxic_direction(result) is None
+
+
+def test_entry_result_payload_includes_signed_vpin_and_toxic_direction():
+    """The payload helper used both for broadcasts and for _last_entry_results
+    must surface the new fields so confluence and the UI see the same view."""
+    result = SimpleNamespace(
+        market_state="TOXIC",
+        long_filter="BLOCKED",
+        short_filter="BLOCKED",
+        reason="toxic_vpin",
+        latest_signal_type=None,
+        latest_signal_confidence=None,
+        vpin=0.95,
+        signed_vpin=0.6,
+    )
+    payload = _entry_result_payload(result)
+
+    assert payload["signed_vpin"] == 0.6
+    assert payload["toxic_direction"] == "BUY"
+    # The unsigned vpin is preserved (no shadowing).
+    assert payload["vpin"] == 0.95
+
+
+def test_entry_result_payload_omits_direction_when_ready():
+    result = SimpleNamespace(
+        market_state="READY",
+        long_filter="OK",
+        short_filter="WAIT",
+        reason="sell_exhaustion",
+        latest_signal_type="SELL_EXHAUSTION",
+        latest_signal_confidence=0.7,
+        vpin=0.1,
+        signed_vpin=0.8,  # high but not in a risk regime => no arrow
+    )
+    payload = _entry_result_payload(result)
+
+    assert payload["signed_vpin"] == 0.8
+    assert payload["toxic_direction"] is None

@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  TOXIC_DIRECTION_THRESHOLD,
   confluenceVisualState,
+  deriveToxicDirection,
   formatEntryFilter,
   formatPosition,
   formatTradingStatus,
@@ -93,29 +95,100 @@ test("formatTradingStatus handles missing payload", () => {
 test("signalVisualState maps long permission to buy", () => {
   assert.deepEqual(
     signalVisualState({ market_state: "READY", long_filter: "OK", short_filter: "WAIT" }),
-    { mode: "buy", label: "BUY", reason: "Long conditions" },
+    { mode: "buy", label: "BUY", reason: "Long conditions", toxicDirection: null },
   );
 });
 
 test("signalVisualState maps short permission to sell", () => {
   assert.deepEqual(
     signalVisualState({ market_state: "READY", long_filter: "WAIT", short_filter: "OK" }),
-    { mode: "sell", label: "SELL", reason: "Short conditions" },
+    { mode: "sell", label: "SELL", reason: "Short conditions", toxicDirection: null },
   );
 });
 
-test("signalVisualState maps toxic to risk", () => {
+test("signalVisualState maps toxic to risk (no direction when signed_vpin missing)", () => {
   assert.deepEqual(
     signalVisualState({ market_state: "TOXIC", reason: "toxic_vpin_watch_only" }),
-    { mode: "risk", label: "RISK", reason: "toxic_vpin_watch_only" },
+    {
+      mode: "risk",
+      label: "RISK",
+      reason: "toxic_vpin_watch_only",
+      toxicDirection: null,
+      signedVpin: null,
+    },
   );
+});
+
+test("signalVisualState shows BUY arrow when toxic flow is buy-side", () => {
+  assert.deepEqual(
+    signalVisualState({
+      market_state: "TOXIC",
+      reason: "toxic_vpin",
+      signed_vpin: 0.42,
+    }),
+    {
+      mode: "risk",
+      label: "RISK \u2191",
+      reason: "toxic_vpin (toxic BUY)",
+      toxicDirection: "BUY",
+      signedVpin: 0.42,
+    },
+  );
+});
+
+test("signalVisualState shows SELL arrow when toxic flow is sell-side", () => {
+  assert.deepEqual(
+    signalVisualState({
+      market_state: "RISKY",
+      reason: "adaptive_elevated_vpin",
+      signed_vpin: -0.18,
+    }),
+    {
+      mode: "risk",
+      label: "RISK \u2193",
+      reason: "adaptive_elevated_vpin (toxic SELL)",
+      toxicDirection: "SELL",
+      signedVpin: -0.18,
+    },
+  );
+});
+
+test("signalVisualState prefers backend toxic_direction over signed_vpin sign", () => {
+  // Backend already classified; UI must trust the server's call rather than
+  // re-deriving from a possibly stale signed_vpin sample.
+  const visual = signalVisualState({
+    market_state: "TOXIC",
+    reason: "toxic_vpin",
+    signed_vpin: -0.5,
+    toxic_direction: "BUY",
+  });
+  assert.equal(visual.toxicDirection, "BUY");
+  assert.equal(visual.label, "RISK \u2191");
+});
+
+test("signalVisualState shows no arrow inside the dead-zone", () => {
+  const visual = signalVisualState({
+    market_state: "TOXIC",
+    reason: "toxic_vpin",
+    signed_vpin: TOXIC_DIRECTION_THRESHOLD / 2,
+  });
+  assert.equal(visual.toxicDirection, null);
+  assert.equal(visual.label, "RISK");
 });
 
 test("signalVisualState defaults to wait", () => {
   assert.deepEqual(
     signalVisualState({ market_state: "READY", reason: "no_signal" }),
-    { mode: "wait", label: "WAIT", reason: "no_signal" },
+    { mode: "wait", label: "WAIT", reason: "no_signal", toxicDirection: null },
   );
+});
+
+test("deriveToxicDirection respects the threshold both sides", () => {
+  assert.equal(deriveToxicDirection({ signed_vpin: TOXIC_DIRECTION_THRESHOLD }), "BUY");
+  assert.equal(deriveToxicDirection({ signed_vpin: -TOXIC_DIRECTION_THRESHOLD }), "SELL");
+  assert.equal(deriveToxicDirection({ signed_vpin: 0 }), null);
+  assert.equal(deriveToxicDirection(null), null);
+  assert.equal(deriveToxicDirection({}), null);
 });
 
 test("confluenceVisualState highlights matching buy signals", () => {
@@ -222,7 +295,27 @@ test("multiExchangeVisualState reports RISK whenever any exchange is toxic, even
     mode: "risk",
     label: "RISK",
     reason: "Gate",
+    toxicDirection: null,
   });
+});
+
+test("multiExchangeVisualState surfaces toxic-flow direction in RISK label", () => {
+  const states = {
+    binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    bybit: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    okx: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
+    gate: {
+      market_state: "TOXIC",
+      reason: "toxic_vpin_watch_only",
+      signed_vpin: 0.5,
+    },
+  };
+  const visual = multiExchangeVisualState(states);
+  assert.equal(visual.mode, "risk");
+  assert.equal(visual.label, "RISK \u2191");
+  assert.equal(visual.toxicDirection, "BUY");
+  // Per-exchange arrow is appended in the reason string for the toxic one.
+  assert.equal(visual.reason, "Gate\u2191");
 });
 
 test("signalVisualState returns off mode for missing payload", () => {
@@ -230,5 +323,42 @@ test("signalVisualState returns off mode for missing payload", () => {
     mode: "off",
     label: "WAIT",
     reason: "No data",
+    toxicDirection: null,
   });
+});
+
+test("formatEntryFilter appends toxic-flow direction in RISK states", () => {
+  assert.equal(
+    formatEntryFilter({
+      market_state: "TOXIC",
+      long_filter: "BLOCKED",
+      short_filter: "BLOCKED",
+      reason: "toxic_vpin",
+      signed_vpin: 0.6,
+    }),
+    "TOXIC | L:BLOCKED S:BLOCKED | toxic_vpin | flow \u2191BUY",
+  );
+  assert.equal(
+    formatEntryFilter({
+      market_state: "RISKY",
+      long_filter: "WAIT",
+      short_filter: "WAIT",
+      reason: "adaptive_elevated_vpin",
+      signed_vpin: -0.3,
+    }),
+    "RISKY | L:WAIT S:WAIT | adaptive_elevated_vpin | flow \u2193SELL",
+  );
+});
+
+test("formatEntryFilter does not add direction outside RISK states", () => {
+  assert.equal(
+    formatEntryFilter({
+      market_state: "READY",
+      long_filter: "OK",
+      short_filter: "WAIT",
+      reason: "buy_exhaustion",
+      signed_vpin: 0.9,
+    }),
+    "READY | L:OK S:WAIT | buy_exhaustion",
+  );
 });

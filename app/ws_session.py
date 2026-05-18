@@ -1624,6 +1624,8 @@ class LiveHeatmapService:
                     "latest_signal_type": result.latest_signal_type,
                     "latest_signal_confidence": result.latest_signal_confidence,
                     "vpin": result.vpin,
+                    "signed_vpin": result.signed_vpin,
+                    "toxic_direction": _toxic_direction(result),
                     "exchange": "binance",
                 }
             )
@@ -1649,6 +1651,8 @@ class LiveHeatmapService:
                     "latest_signal_type": result.latest_signal_type,
                     "latest_signal_confidence": result.latest_signal_confidence,
                     "vpin": result.vpin,
+                    "signed_vpin": result.signed_vpin,
+                    "toxic_direction": _toxic_direction(result),
                 }
             )
         # Coinbase + Kraken indicator broadcasts are intentionally suppressed
@@ -1719,6 +1723,8 @@ class LiveHeatmapService:
                 "latest_signal_type": result.latest_signal_type,
                 "latest_signal_confidence": result.latest_signal_confidence,
                 "vpin": result.vpin,
+                "signed_vpin": result.signed_vpin,
+                "toxic_direction": _toxic_direction(result),
             }
         )
 
@@ -1742,7 +1748,40 @@ def _entry_result_payload(result: Any) -> dict[str, Any]:
         "latest_signal_type": result.latest_signal_type,
         "latest_signal_confidence": result.latest_signal_confidence,
         "vpin": result.vpin,
+        "signed_vpin": getattr(result, "signed_vpin", 0.0),
+        "toxic_direction": _toxic_direction(result),
     }
+
+
+# Net imbalance below this absolute value is treated as "no clear direction".
+# Matches the UI threshold so the same indicator is shown on both sides.
+TOXIC_DIRECTION_MIN_SIGNED_VPIN = 0.05
+
+
+def _toxic_direction(result: Any) -> str | None:
+    """Return ``"BUY"`` / ``"SELL"`` for TOXIC / RISKY results, else ``None``.
+
+    Direction is derived from ``signed_vpin`` (range ``[-1, +1]``). A small
+    dead-zone (``TOXIC_DIRECTION_MIN_SIGNED_VPIN``) suppresses the arrow when
+    the net imbalance is too close to zero to call a side -- the regime can
+    be toxic by volatility alone with roughly balanced buy/sell flow.
+
+    Outside TOXIC / RISKY (i.e. NORMAL, READY, WARMING) this returns ``None``
+    so the UI keeps its existing rendering for non-risk states. The raw
+    ``signed_vpin`` value is still broadcast separately for diagnostics.
+    """
+    market_state = _entry_value(result, "market_state")
+    if market_state not in CONFLUENCE_RISK_STATES:
+        return None
+    try:
+        signed = float(_entry_value(result, "signed_vpin") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if signed >= TOXIC_DIRECTION_MIN_SIGNED_VPIN:
+        return "BUY"
+    if signed <= -TOXIC_DIRECTION_MIN_SIGNED_VPIN:
+        return "SELL"
+    return None
 
 
 def _entry_value(result: Any, key: str) -> Any:

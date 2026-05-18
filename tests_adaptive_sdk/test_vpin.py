@@ -272,6 +272,90 @@ def test_rolling_daily_respects_min_bucket_size():
     assert eng.bucket_size >= 5.0
 
 
+# ---------------------------------------------------------------------------
+# Signed (directional) VPIN
+# ---------------------------------------------------------------------------
+
+
+def test_signed_vpin_is_zero_before_any_closed_bucket():
+    cfg = SymbolConfig(
+        classification_mode=ClassificationMode.TRADE_SIGN,
+        bucket_fill_mode=BucketFillMode.EXACT_FILL,
+        fixed_bucket_size=10.0,
+        vpin_window=10,
+    )
+    eng = TrueVPINEngine(cfg)
+    # Open bucket but nothing closed yet.
+    eng.on_trade(_make_tick(qty=1.0, buyer_aggr=True))
+    assert eng.signed_vpin == 0.0
+
+
+def test_signed_vpin_pure_buy_flow_is_plus_one():
+    cfg = SymbolConfig(
+        classification_mode=ClassificationMode.TRADE_SIGN,
+        bucket_fill_mode=BucketFillMode.EXACT_FILL,
+        fixed_bucket_size=1.0,
+        vpin_window=100,
+    )
+    eng = TrueVPINEngine(cfg)
+    # 5 pure-buy buckets, each exactly bucket_size.
+    eng.on_trade(_make_tick(qty=5.0, buyer_aggr=True))
+    assert eng.buckets_filled == 5
+    assert eng.signed_vpin == pytest.approx(1.0)
+    # Unsigned VPIN must also be 1.0 -- |v_buy - v_sell| == v_bucket on each.
+    assert eng.vpin == pytest.approx(1.0)
+
+
+def test_signed_vpin_pure_sell_flow_is_minus_one():
+    cfg = SymbolConfig(
+        classification_mode=ClassificationMode.TRADE_SIGN,
+        bucket_fill_mode=BucketFillMode.EXACT_FILL,
+        fixed_bucket_size=1.0,
+        vpin_window=100,
+    )
+    eng = TrueVPINEngine(cfg)
+    eng.on_trade(_make_tick(qty=5.0, buyer_aggr=False))
+    assert eng.buckets_filled == 5
+    assert eng.signed_vpin == pytest.approx(-1.0)
+    # Unsigned counterpart is +1.0 (magnitude only).
+    assert eng.vpin == pytest.approx(1.0)
+
+
+def test_signed_vpin_balanced_flow_is_near_zero():
+    cfg = SymbolConfig(
+        classification_mode=ClassificationMode.TRADE_SIGN,
+        bucket_fill_mode=BucketFillMode.EXACT_FILL,
+        fixed_bucket_size=1.0,
+        vpin_window=10,
+    )
+    eng = TrueVPINEngine(cfg)
+    # 5 buy buckets, then 5 sell buckets. signed = 0; unsigned = 1.
+    eng.on_trade(_make_tick(qty=5.0, buyer_aggr=True))
+    eng.on_trade(_make_tick(qty=5.0, buyer_aggr=False))
+    assert eng.buckets_filled == 10
+    assert eng.signed_vpin == pytest.approx(0.0, abs=1e-12)
+    assert eng.vpin == pytest.approx(1.0)
+
+
+def test_signed_vpin_is_clamped_in_unit_range():
+    """Math guarantees |signed_vpin| <= 1, but verify it holds with a mix."""
+    cfg = SymbolConfig(
+        classification_mode=ClassificationMode.TRADE_SIGN,
+        bucket_fill_mode=BucketFillMode.EXACT_FILL,
+        fixed_bucket_size=2.0,
+        vpin_window=10,
+    )
+    eng = TrueVPINEngine(cfg)
+    # Mixed flow: buy 1.5, sell 0.5 over a 2.0 bucket. Net = +1.0; signed = +0.5.
+    # Repeat to fill several buckets.
+    for _ in range(10):
+        eng.on_trade(_make_tick(qty=1.5, buyer_aggr=True))
+        eng.on_trade(_make_tick(qty=0.5, buyer_aggr=False))
+    assert eng.buckets_filled >= 5
+    assert -1.0 <= eng.signed_vpin <= 1.0
+    assert eng.signed_vpin == pytest.approx(0.5, abs=1e-9)
+
+
 def test_rolling_daily_can_use_configured_one_minute_window():
     cfg = SymbolConfig(
         classification_mode=ClassificationMode.TRADE_SIGN,

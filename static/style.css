@@ -241,6 +241,14 @@ body {
   background: rgba(217, 119, 6, 0.9);
 }
 
+.exchange-half[data-arrow]::after {
+  content: attr(data-arrow);
+  margin-left: 4px;
+  font-size: 15px;
+  font-weight: 900;
+  line-height: 1;
+}
+
 .buy-light .exchange-half.active {
   background: rgba(22, 163, 74, 0.9);
 }

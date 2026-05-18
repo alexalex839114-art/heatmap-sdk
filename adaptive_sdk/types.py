@@ -174,6 +174,10 @@ class SymbolState:
     pending_signals_count: int
     buckets_filled: int
     realized_vol: float = 0.0
+    # Signed (directional) VPIN over the same window, in [-1, +1].
+    # Positive => net BUY flow; negative => net SELL flow.
+    # Independent of the toxicity gate.
+    signed_vpin: float = 0.0
 
 
 # ---------------------------------------------------------------------------
