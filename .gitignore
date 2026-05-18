@@ -23,3 +23,7 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime artifacts (deploy/start.sh)
+.server.pid
+logs/
