@@ -284,7 +284,11 @@ test("multiExchangeVisualState reports MIXED when buy and sell coexist", () => {
   });
 });
 
-test("multiExchangeVisualState reports RISK whenever any exchange is toxic, even with three BUY", () => {
+test("multiExchangeVisualState shows BUY x3 even with one TOXIC venue (permissive confluence)", () => {
+  // Under the user-specified permissive policy, TOXIC on a minority of
+  // venues does not veto a 3-of-4 same-side consensus. The light shows
+  // BUY x3 to match the backend's actual entry decision, but the reason
+  // still surfaces which venue is risky so the trader has visibility.
   const states = {
     binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     bybit: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
@@ -292,29 +296,25 @@ test("multiExchangeVisualState reports RISK whenever any exchange is toxic, even
     gate: { market_state: "TOXIC", reason: "toxic_vpin_watch_only" },
   };
   assert.deepEqual(multiExchangeVisualState(states), {
-    mode: "risk",
-    label: "RISK",
-    reason: "Gate",
-    toxicDirection: null,
+    mode: "buy",
+    label: "BUY x3",
+    reason: "Binance + Bybit + OKX \u2022 risk: Gate",
   });
 });
 
-test("multiExchangeVisualState surfaces toxic-flow direction in RISK label", () => {
+test("multiExchangeVisualState reports RISK when there is no 3-of-same and some venue is toxic", () => {
+  // Only 2 BUY (not 3-of-same) + 1 TOXIC + 1 WAIT -> not tradeable, but
+  // still RISK-flagged so the trader sees the toxic flow.
   const states = {
     binance: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
     bybit: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
-    okx: { market_state: "READY", long_filter: "OK", short_filter: "WAIT" },
-    gate: {
-      market_state: "TOXIC",
-      reason: "toxic_vpin_watch_only",
-      signed_vpin: 0.5,
-    },
+    okx: { market_state: "READY", long_filter: "WAIT", short_filter: "WAIT", reason: "no_signal" },
+    gate: { market_state: "TOXIC", reason: "toxic_vpin_watch_only", signed_vpin: 0.5 },
   };
   const visual = multiExchangeVisualState(states);
   assert.equal(visual.mode, "risk");
   assert.equal(visual.label, "RISK \u2191");
   assert.equal(visual.toxicDirection, "BUY");
-  // Per-exchange arrow is appended in the reason string for the toxic one.
   assert.equal(visual.reason, "Gate\u2191");
 });
 

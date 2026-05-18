@@ -1802,7 +1802,10 @@ def _exchange_signal_mode(result: Any) -> str:
     the same traffic-light state the user sees. Modes:
 
     * ``"risk"`` -- market_state is TOXIC or RISKY (toxic VPIN, elevated
-      regime, etc.). Blocks entry and triggers exit.
+      regime, etc.). The UI still renders this with a red RISK light + a
+      ``toxic_direction`` arrow, but trading-wise it is treated the same as
+      ``"wait"`` -- it neither contributes to nor blocks the 3-of-4
+      confluence. See ``_confluence_entry_side`` / ``_confluence_exit_reason``.
     * ``"buy"``  -- long_filter == OK and short_filter != OK.
     * ``"sell"`` -- short_filter == OK and long_filter != OK.
     * ``"wait"`` -- everything else (warming, no_signal, both filters OK,
@@ -1828,32 +1831,31 @@ def _exchange_signal_mode(result: Any) -> str:
 
 def _confluence_entry_side(results: dict[str, Any]) -> str | None:
     """Return the entry side when at least ``CONFLUENCE_MIN_AGREE`` of the
-    four exchanges agree on the same direction with no opposite signal and
-    no TOXIC/RISKY exchange.
+    four exchanges agree on the same direction with no opposite signal.
 
     The full ruleset:
 
     * Need 3-of-4 exchanges with the same directional mode (``buy`` or
-      ``sell``). The 4th exchange may be ``wait`` (e.g. still warming).
+      ``sell``). The remaining exchange(s) may be ``wait`` (still warming)
+    *  or ``risk`` (TOXIC / RISKY) -- both are treated as neutral and
+      neither contribute to nor block the entry.
     * Zero exchanges may show the opposite direction.
-    * Zero exchanges may be ``risk`` (TOXIC/RISKY). Any single risky
-      exchange blocks entry even if three others agree.
 
-    The exit policy is the mirror image, see ``_confluence_exit_reason``.
+    TOXIC / RISKY on a single venue used to block entry, but the user
+    explicitly opted into a more permissive regime: a noisy / toxic single
+    feed should not veto a 3-of-4 same-side consensus. The exit policy is
+    the mirror image (see ``_confluence_exit_reason``) so we don't enter
+    and immediately get kicked out by the same TOXIC reading.
     """
     long_count = 0
     short_count = 0
-    risk_count = 0
     for exchange in CONFLUENCE_EXCHANGES:
         mode = _exchange_signal_mode(results.get(exchange))
-        if mode == "risk":
-            risk_count += 1
-        elif mode == "buy":
+        if mode == "buy":
             long_count += 1
         elif mode == "sell":
             short_count += 1
-    if risk_count > 0:
-        return None
+        # "risk" and "wait" are both neutral -- ignored for direction count.
     if long_count >= CONFLUENCE_MIN_AGREE and short_count == 0:
         return "LONG"
     if short_count >= CONFLUENCE_MIN_AGREE and long_count == 0:
@@ -1865,18 +1867,20 @@ def _confluence_exit_reason(
     side: str | None, results: dict[str, Any]
 ) -> str | None:
     """Return an exit reason when the open position is no longer backed by a
-    3-of-4 same-side confluence, or any exchange has degraded to toxic /
-    risky / opposite. Mirrors ``_confluence_entry_side``.
+    3-of-4 same-side confluence, or any exchange flips to the opposite
+    direction. Mirrors ``_confluence_entry_side``.
 
     Returned reason strings:
 
-    * ``"confluence_exit_risk:<exchanges>"`` -- one or more exchanges are
-      TOXIC or RISKY (e.g. toxic VPIN, elevated regime).
-    * ``"confluence_exit_opposite_signal"``  -- at least one exchange now
+    * ``"confluence_exit_opposite_signal"`` -- at least one exchange now
       shows the opposite directional filter.
-    * ``"confluence_exit_lost"``             -- same-side count fell below
+    * ``"confluence_exit_lost"``            -- same-side count fell below
       the 3-of-4 threshold (signal "disappeared" on at least one of the
-      exchanges that originally agreed).
+      exchanges that originally agreed). A venue that switches from BUY
+      to TOXIC / RISKY also counts here, because it stops contributing to
+      the same-side count -- but a single TOXIC venue alongside three
+      still-BUY venues does NOT trigger an exit on its own. This matches
+      the more permissive entry rule.
     """
     if side not in {"LONG", "SHORT"}:
         return None
@@ -1884,17 +1888,15 @@ def _confluence_exit_reason(
     opposite_target = "sell" if side == "LONG" else "buy"
     same_side_count = 0
     opposite_count = 0
-    risk_exchanges: list[str] = []
     for exchange in CONFLUENCE_EXCHANGES:
         mode = _exchange_signal_mode(results.get(exchange))
-        if mode == "risk":
-            risk_exchanges.append(exchange)
-        elif mode == same_side_target:
+        if mode == same_side_target:
             same_side_count += 1
         elif mode == opposite_target:
             opposite_count += 1
-    if risk_exchanges:
-        return f"confluence_exit_risk:{'+'.join(risk_exchanges)}"
+        # "risk" and "wait" are both neutral -- they reduce the same-side
+        # count (and may trigger 'confluence_exit_lost') but do not by
+        # themselves close the position the way the old rule did.
     if opposite_count > 0:
         return "confluence_exit_opposite_signal"
     if same_side_count < CONFLUENCE_MIN_AGREE:

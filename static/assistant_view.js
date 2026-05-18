@@ -145,9 +145,46 @@ export function multiExchangeVisualState(exchangeStates) {
   const sell = visuals.filter((v) => v.visual.mode === "sell");
   const risk = visuals.filter((v) => v.visual.mode === "risk");
 
-  // RISK takes priority — any exchange showing TOXIC/RISKY blocks the
-  // confluence light from showing BUY/SELL, mirroring the backend's
-  // _confluence_entry_side ruleset.
+  // Mixed directional signals always block. This stays first because the
+  // user does not want to enter when venues disagree on direction.
+  if (buy.length && sell.length) {
+    return { mode: "wait", label: "MIXED", reason: "Signals diverge" };
+  }
+
+  // 3-of-4 same-side consensus takes priority over a single RISK venue.
+  // Mirrors the backend _confluence_entry_side rule: TOXIC / RISKY on a
+  // minority of venues is treated as neutral (like WAIT) and does not
+  // veto a same-side consensus on the other three. When such a venue
+  // does exist we still hint at it in `reason` so the trader knows.
+  if (buy.length >= CONFLUENCE_MIN_AGREE) {
+    const reasonParts = [buy.map((v) => EXCHANGE_LABELS[v.name]).join(" + ")];
+    if (risk.length > 0) {
+      reasonParts.push(
+        `risk: ${risk.map((v) => EXCHANGE_LABELS[v.name]).join(" / ")}`,
+      );
+    }
+    return {
+      mode: "buy",
+      label: `BUY x${buy.length}`,
+      reason: reasonParts.join(" • "),
+    };
+  }
+  if (sell.length >= CONFLUENCE_MIN_AGREE) {
+    const reasonParts = [sell.map((v) => EXCHANGE_LABELS[v.name]).join(" + ")];
+    if (risk.length > 0) {
+      reasonParts.push(
+        `risk: ${risk.map((v) => EXCHANGE_LABELS[v.name]).join(" / ")}`,
+      );
+    }
+    return {
+      mode: "sell",
+      label: `SELL x${sell.length}`,
+      reason: reasonParts.join(" • "),
+    };
+  }
+
+  // No 3-of-same consensus. If at least one venue is risky, surface that
+  // so the trader can see flow toxicity even without a tradeable signal.
   if (risk.length > 0) {
     const buyDir = risk.filter((v) => v.visual.toxicDirection === "BUY").length;
     const sellDir = risk.filter((v) => v.visual.toxicDirection === "SELL").length;
@@ -168,23 +205,7 @@ export function multiExchangeVisualState(exchangeStates) {
       toxicDirection: summaryDirection,
     };
   }
-  if (buy.length && sell.length) {
-    return { mode: "wait", label: "MIXED", reason: "Signals diverge" };
-  }
-  if (buy.length >= CONFLUENCE_MIN_AGREE) {
-    return {
-      mode: "buy",
-      label: `BUY x${buy.length}`,
-      reason: buy.map((v) => EXCHANGE_LABELS[v.name]).join(" + "),
-    };
-  }
-  if (sell.length >= CONFLUENCE_MIN_AGREE) {
-    return {
-      mode: "sell",
-      label: `SELL x${sell.length}`,
-      reason: sell.map((v) => EXCHANGE_LABELS[v.name]).join(" + "),
-    };
-  }
+
   // Partial alignment (1-2 exchanges agree). Light stays grey/WAIT so the
   // trader does not act on a sub-confluence signal, but the reason hints
   // which way the partial pressure is.

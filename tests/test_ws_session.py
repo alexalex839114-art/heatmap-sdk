@@ -1463,13 +1463,47 @@ def test_confluence_entry_side_opposite_signal_blocks_entry():
     )
 
 
-def test_confluence_entry_side_any_toxic_blocks_entry_even_with_three_buy():
+def test_confluence_entry_side_toxic_on_minority_does_not_block_long():
+    """User-specified policy change: TOXIC on a single exchange is treated
+    as neutral (like WAIT). Three BUY venues + one TOXIC venue is still a
+    valid LONG entry."""
+    assert (
+        _confluence_entry_side(
+            {
+                "binance": _TOXIC_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _BUY_RESULT,
+                "gate": _BUY_RESULT,
+            }
+        )
+        == "LONG"
+    )
+
+
+def test_confluence_entry_side_risky_on_minority_does_not_block_short():
+    """Symmetric for SHORT and for the RISKY (vs TOXIC) market state."""
+    assert (
+        _confluence_entry_side(
+            {
+                "binance": _SELL_RESULT,
+                "bybit": _RISKY_RESULT,
+                "okx": _SELL_RESULT,
+                "gate": _SELL_RESULT,
+            }
+        )
+        == "SHORT"
+    )
+
+
+def test_confluence_entry_side_two_toxic_two_buy_does_not_enter():
+    """TOXIC is treated as WAIT, so two TOXIC + two BUY leaves only 2/3
+    of the same-side count, which is below the threshold."""
     assert (
         _confluence_entry_side(
             {
                 "binance": _BUY_RESULT,
                 "bybit": _BUY_RESULT,
-                "okx": _BUY_RESULT,
+                "okx": _TOXIC_RESULT,
                 "gate": _TOXIC_RESULT,
             }
         )
@@ -1477,14 +1511,14 @@ def test_confluence_entry_side_any_toxic_blocks_entry_even_with_three_buy():
     )
 
 
-def test_confluence_entry_side_any_risky_blocks_entry():
+def test_confluence_entry_side_all_toxic_does_not_enter():
     assert (
         _confluence_entry_side(
             {
-                "binance": _BUY_RESULT,
-                "bybit": _BUY_RESULT,
-                "okx": _BUY_RESULT,
-                "gate": _RISKY_RESULT,
+                "binance": _TOXIC_RESULT,
+                "bybit": _TOXIC_RESULT,
+                "okx": _TOXIC_RESULT,
+                "gate": _TOXIC_RESULT,
             }
         )
         is None
@@ -1542,34 +1576,57 @@ def test_confluence_exit_reason_fires_on_opposite_signal():
     )
 
 
-def test_confluence_exit_reason_fires_on_any_toxic_exchange():
-    reason = _confluence_exit_reason(
-        "LONG",
-        {
-            "binance": _BUY_RESULT,
-            "bybit": _BUY_RESULT,
-            "okx": _BUY_RESULT,
-            "gate": _TOXIC_RESULT,
-        },
+def test_confluence_exit_reason_none_when_one_venue_toxic_but_three_still_buy():
+    """Mirror of the entry rule: a single TOXIC venue alongside three
+    still-BUY venues does NOT close the LONG position. Otherwise we'd
+    enter on 3 BUY + 1 TOXIC and immediately get kicked out by the same
+    snapshot."""
+    assert (
+        _confluence_exit_reason(
+            "LONG",
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _BUY_RESULT,
+                "gate": _TOXIC_RESULT,
+            },
+        )
+        is None
     )
-    assert reason is not None
-    assert reason.startswith("confluence_exit_risk:")
-    assert "gate" in reason
 
 
-def test_confluence_exit_reason_fires_on_any_risky_exchange():
-    reason = _confluence_exit_reason(
-        "LONG",
-        {
-            "binance": _BUY_RESULT,
-            "bybit": _BUY_RESULT,
-            "okx": _RISKY_RESULT,
-            "gate": _BUY_RESULT,
-        },
+def test_confluence_exit_reason_fires_when_toxic_drops_count_below_three():
+    """If TOXIC appears on a previously-BUY venue and brings the same-side
+    count below 3-of-4, the position is closed via 'confluence_exit_lost'
+    (not a TOXIC-specific reason)."""
+    assert (
+        _confluence_exit_reason(
+            "LONG",
+            {
+                "binance": _BUY_RESULT,
+                "bybit": _BUY_RESULT,
+                "okx": _TOXIC_RESULT,
+                "gate": _TOXIC_RESULT,
+            },
+        )
+        == "confluence_exit_lost"
     )
-    assert reason is not None
-    assert reason.startswith("confluence_exit_risk:")
-    assert "okx" in reason
+
+
+def test_confluence_exit_reason_none_when_one_venue_risky_but_three_still_sell():
+    """Same as the TOXIC mirror but for RISKY market state and SHORT side."""
+    assert (
+        _confluence_exit_reason(
+            "SHORT",
+            {
+                "binance": _SELL_RESULT,
+                "bybit": _SELL_RESULT,
+                "okx": _SELL_RESULT,
+                "gate": _RISKY_RESULT,
+            },
+        )
+        is None
+    )
 
 
 def test_confluence_exit_reason_mirror_for_short():
@@ -1605,7 +1662,12 @@ def test_confluence_exit_reason_none_for_unknown_side():
 
 @pytest.mark.asyncio
 async def test_evaluate_exit_closes_position_when_confluence_collapses():
-    """Open LONG; one exchange flips to TOXIC; market close fires immediately."""
+    """Open LONG; two exchanges flip to TOXIC so same-side count drops below
+    3-of-4; market close fires immediately via 'confluence_exit_lost'.
+
+    Under the permissive policy a single TOXIC venue alone does NOT close
+    the position (see test_evaluate_exit_does_not_close_on_single_toxic).
+    """
     from app.exit_engine import ExitEngine
 
     service = LiveHeatmapService()
@@ -1622,8 +1684,8 @@ async def test_evaluate_exit_closes_position_when_confluence_collapses():
     service._last_entry_results = {
         "binance": _BUY_RESULT,
         "bybit": _BUY_RESULT,
-        "okx": _BUY_RESULT,
-        "gate": _TOXIC_RESULT,  # newly toxic — should trigger exit
+        "okx": _TOXIC_RESULT,
+        "gate": _TOXIC_RESULT,  # two TOXIC venues → same-side count = 2 < 3
     }
     events = []
 
@@ -1648,13 +1710,58 @@ async def test_evaluate_exit_closes_position_when_confluence_collapses():
 
     assert decision.should_close is True
     assert decision.hard_exit is True
-    assert decision.reason is not None
-    assert decision.reason.startswith("confluence_exit_risk:")
+    assert decision.reason == "confluence_exit_lost"
     assert len(service.order_executor.calls) == 1
     # First broadcast is the exit_status, second is the order_status.
     assert events[0]["type"] == "exit_status"
     assert events[0]["should_close"] is True
     assert events[1]["type"] == "order_status"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_exit_does_not_close_on_single_toxic_venue():
+    """Permissive policy mirror: with 3 BUY + 1 TOXIC the LONG stays open."""
+    from app.exit_engine import ExitEngine
+
+    service = LiveHeatmapService()
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=True,
+    )
+    service.current_position = PositionState(
+        symbol="BTCUSDT",
+        amount=0.01,
+        entry_price=65000,
+    )
+    service.exit_engine = ExitEngine()
+    service._last_entry_results = {
+        "binance": _BUY_RESULT,
+        "bybit": _BUY_RESULT,
+        "okx": _BUY_RESULT,
+        "gate": _TOXIC_RESULT,
+    }
+    events = []
+
+    async def capture(payload):
+        events.append(payload)
+
+    service.broadcast = capture
+
+    class FakeExecutor:
+        close_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def close_position(self, position):
+            self.calls.append(position)
+            return {"status": "NEW", "clientOrderId": "close-1"}
+
+    service.order_executor = FakeExecutor()
+
+    decision = await service._evaluate_exit(now_ms=1000)
+
+    assert decision.should_close is False
+    assert service.order_executor.calls == []
 
 
 @pytest.mark.asyncio
@@ -1845,7 +1952,9 @@ async def test_auto_trade_does_not_open_on_two_of_four_confluence():
 
 
 @pytest.mark.asyncio
-async def test_auto_trade_does_not_open_when_any_exchange_toxic():
+async def test_auto_trade_opens_when_three_buy_and_one_toxic():
+    """Under the user-specified permissive policy a single TOXIC venue is
+    treated as neutral. 3 BUY + 1 TOXIC must still open a LONG position."""
     service = LiveHeatmapService()
     service.session.mark_synced("BTCUSDT")
     service.session.assistant_settings = AssistantRiskSettings(
@@ -1882,7 +1991,51 @@ async def test_auto_trade_does_not_open_when_any_exchange_toxic():
 
     await service._evaluate_auto_trade(now_ms=1000)
 
-    # 3 BUY + 1 TOXIC: TOXIC blocks entry.
+    assert len(service.order_executor.calls) == 1
+    _, kwargs = service.order_executor.calls[0]
+    assert kwargs.get("side") == "LONG"
+
+
+@pytest.mark.asyncio
+async def test_auto_trade_does_not_open_when_two_buy_two_toxic():
+    """TOXIC is neutral but does not contribute to the same-side count.
+    2 BUY + 2 TOXIC drops below the 3-of-4 threshold -> no entry."""
+    service = LiveHeatmapService()
+    service.session.mark_synced("BTCUSDT")
+    service.session.assistant_settings = AssistantRiskSettings(
+        auto_trade_enabled=True,
+    )
+    service.current_position = None
+    service.trading_state = "ARMED"
+    service.client = SimpleNamespace(quantity_step=0.001, min_quantity=0.001)
+    service.book.bids = {64999.0: 1.0}
+    service.book.asks = {65000.0: 1.0}
+    service._last_entry_results = {
+        "binance": _BUY_RESULT,
+        "bybit": _BUY_RESULT,
+        "okx": _TOXIC_RESULT,
+        "gate": _TOXIC_RESULT,
+    }
+
+    class FakeExecutor:
+        open_pending = False
+
+        def __init__(self):
+            self.calls = []
+
+        async def open_position(self, symbol, **kwargs):
+            self.calls.append((symbol, kwargs))
+            return {"status": "NEW"}
+
+    service.order_executor = FakeExecutor()
+
+    async def capture(payload):
+        pass
+
+    service.broadcast = capture
+
+    await service._evaluate_auto_trade(now_ms=1000)
+
     assert service.order_executor.calls == []
 
 
