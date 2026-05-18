@@ -10,6 +10,7 @@ import {
 const symbolInput = document.getElementById("symbol");
 const compressionInput = document.getElementById("compression");
 const connectButton = document.getElementById("connect-btn");
+const stopWsButton = document.getElementById("stop-ws-btn");
 const toggleButton = document.getElementById("toggle-btn");
 const statusNode = document.getElementById("status");
 const displayStepNode = document.getElementById("display-step");
@@ -158,6 +159,9 @@ function ensureSocket() {
       toggleButton.disabled = !["live_ready", "streaming", "stopped"].includes(payload.state);
       tradingToggleButton.disabled = !["live_ready", "streaming", "stopped"].includes(payload.state);
       emergencyFlattenButton.disabled = !["live_ready", "streaming", "stopped"].includes(payload.state);
+      // Stop WS button is enabled any time the user has initiated a connect;
+      // includes 'connecting' so a still-handshaking session can be aborted.
+      stopWsButton.disabled = !["connecting", "live_ready", "streaming", "stopped"].includes(payload.state);
       if (payload.state === "streaming") {
         streaming = true;
         toggleButton.textContent = "Stop Heatmap";
@@ -250,6 +254,7 @@ function ensureSocket() {
     toggleButton.disabled = true;
     tradingToggleButton.disabled = true;
     emergencyFlattenButton.disabled = true;
+    stopWsButton.disabled = true;
     streaming = false;
     tradingActive = false;
     toggleButton.textContent = "Start Heatmap";
@@ -321,6 +326,34 @@ connectButton.addEventListener("click", () => {
   } else {
     ws.addEventListener("open", sendConnect, { once: true });
   }
+});
+
+stopWsButton.addEventListener("click", () => {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  socket.send(JSON.stringify({ type: "disconnect" }));
+  // Optimistic local reset so lights / heatmap go cold immediately. The
+  // authoritative 'status' broadcast that follows keeps us in sync.
+  setStatus("disconnecting");
+  stopWsButton.disabled = true;
+  toggleButton.disabled = true;
+  tradingToggleButton.disabled = true;
+  emergencyFlattenButton.disabled = true;
+  streaming = false;
+  tradingActive = false;
+  toggleButton.textContent = "Start Heatmap";
+  tradingToggleButton.textContent = "START Trading";
+  setDisplayStep(null, null);
+  renderer.reset();
+  for (const name of Object.keys(exchangeSignals)) {
+    exchangeSignals[name] = null;
+    exchangeStatus[name] = null;
+    setSignalVisual({ exchange: name });
+  }
+  entryFilterNode.textContent = "entry: -";
+  positionStateNode.textContent = "position: flat";
+  exitStateNode.textContent = "exit: -";
 });
 
 toggleButton.addEventListener("click", () => {

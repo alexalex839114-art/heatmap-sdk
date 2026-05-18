@@ -37,6 +37,26 @@ def test_stop_heatmap_changes_state_to_stopped():
 
 
 @pytest.mark.asyncio
+async def test_disconnect_command_returns_disconnected_state():
+    """`{type: "disconnect"}` from the UI must transition the session back to
+    ``disconnected`` and clear the active symbol so the Stop WS button gives
+    the user a clean reset path."""
+    session = BrowserSession()
+    session.mark_synced("BTCUSDT")
+    session.compression = 4
+    assert session.state == "live_ready"
+
+    event = await session.handle_command({"type": "disconnect"})
+
+    assert event["type"] == "status"
+    assert event["state"] == "disconnected"
+    assert event["symbol"] is None
+    assert session.state == "disconnected"
+    assert session.symbol is None
+    assert session.compression == 1
+
+
+@pytest.mark.asyncio
 async def test_set_assistant_settings_updates_risk_settings():
     session = BrowserSession()
 
